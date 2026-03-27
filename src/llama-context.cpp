@@ -162,6 +162,10 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.type_k_outlier = params.type_k_outlier;
+    cparams.type_v_outlier = params.type_v_outlier;
+    cparams.n_outlier_k_ch = params.n_outlier_k_ch;
+    cparams.n_outlier_v_ch = params.n_outlier_v_ch;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -273,9 +277,13 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k   =*/ params.type_k,
-            /*.type_v   =*/ params.type_v,
-            /*.swa_full =*/ params.swa_full,
+            /*.type_k          =*/ params.type_k,
+            /*.type_v          =*/ params.type_v,
+            /*.type_k_outlier  =*/ params.type_k_outlier,
+            /*.type_v_outlier  =*/ params.type_v_outlier,
+            /*.n_outlier_k_ch  =*/ params.n_outlier_k_ch,
+            /*.n_outlier_v_ch  =*/ params.n_outlier_v_ch,
+            /*.swa_full        =*/ params.swa_full,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -2904,6 +2912,10 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.type_k_outlier              =*/ GGML_TYPE_COUNT,
+        /*.type_v_outlier              =*/ GGML_TYPE_COUNT,
+        /*.n_outlier_k_ch              =*/ 0,
+        /*.n_outlier_v_ch              =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -2974,8 +2986,58 @@ llama_context * llama_init_from_model(
         }
     }
 
+    const auto is_tbq = [](ggml_type type) {
+        return type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0 ||
+               type == GGML_TYPE_TBQP3_0 || type == GGML_TYPE_TBQP4_0;
+    };
+
+    const auto validate_outlier_split = [&](const char * name, ggml_type type_lo, ggml_type type_hi, uint32_t n_outlier_ch, bool is_k) -> bool {
+        if (type_hi == GGML_TYPE_COUNT && n_outlier_ch == 0) {
+            return true;
+        }
+
+        if (type_hi == GGML_TYPE_COUNT || n_outlier_ch == 0) {
+            LLAMA_LOG_ERROR("%s: %s outlier split requires both an outlier cache type and a non-zero channel count\n", __func__, name);
+            return false;
+        }
+
+        if (!is_tbq(type_lo) || !is_tbq(type_hi)) {
+            LLAMA_LOG_ERROR("%s: %s outlier split currently supports only TurboQuant cache types\n", __func__, name);
+            return false;
+        }
+
+        for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
+            const uint32_t n_embd_head = is_k ? model->hparams.n_embd_head_k(il) : model->hparams.n_embd_head_v(il);
+            if (n_embd_head % 128 != 0) {
+                LLAMA_LOG_ERROR("%s: %s outlier split requires n_embd_head_%c to be a multiple of 128, got %u in layer %u\n",
+                        __func__, name, is_k ? 'k' : 'v', n_embd_head, il);
+                return false;
+            }
+            if (n_outlier_ch >= 128) {
+                LLAMA_LOG_ERROR("%s: %s outlier split requires outlier channels per 128-wide TurboQuant slice < 128 (%u >= 128)\n",
+                        __func__, name, n_outlier_ch);
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    if (!validate_outlier_split("K cache", params.type_k, params.type_k_outlier, params.n_outlier_k_ch, true)) {
+        return nullptr;
+    }
+
+    if (!validate_outlier_split("V cache", params.type_v, params.type_v_outlier, params.n_outlier_v_ch, false)) {
+        return nullptr;
+    }
+
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
         LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
+        return nullptr;
+    }
+
+    if (params.type_v_outlier != GGML_TYPE_COUNT && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        LLAMA_LOG_ERROR("%s: V cache outlier quantization requires flash_attn\n", __func__);
         return nullptr;
     }
 

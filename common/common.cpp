@@ -1379,6 +1379,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.type_k_outlier = params.cache_type_k_outlier;
+    cparams.type_v_outlier = params.cache_type_v_outlier;
+    cparams.n_outlier_k_ch = params.cache_outlier_k_ch;
+    cparams.n_outlier_v_ch = params.cache_outlier_v_ch;
 
     return cparams;
 }

@@ -23,6 +23,10 @@ public:
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
+                ggml_type   type_k_outlier,
+                ggml_type   type_v_outlier,
+                uint32_t    n_outlier_k_ch,
+                uint32_t    n_outlier_v_ch,
                      bool   v_trans,
                  uint32_t   kv_size,
                  uint32_t   n_pad,

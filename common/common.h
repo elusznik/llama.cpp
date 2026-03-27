@@ -343,6 +343,10 @@ struct common_params_speculative {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k_outlier = GGML_TYPE_COUNT; // outlier KV cache data type for the K
+    ggml_type cache_type_v_outlier = GGML_TYPE_COUNT; // outlier KV cache data type for the V
+    uint32_t  cache_outlier_k_ch = 0; // number of outlier K channels per KV head
+    uint32_t  cache_outlier_v_ch = 0; // number of outlier V channels per KV head
 
     struct cpu_params cpuparams;
     struct cpu_params cpuparams_batch;
@@ -548,6 +552,10 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k_outlier = GGML_TYPE_COUNT; // outlier KV cache data type for the K
+    ggml_type cache_type_v_outlier = GGML_TYPE_COUNT; // outlier KV cache data type for the V
+    uint32_t  cache_outlier_k_ch = 0; // number of outlier K channels per KV head
+    uint32_t  cache_outlier_v_ch = 0; // number of outlier V channels per KV head
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

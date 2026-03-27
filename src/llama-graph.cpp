@@ -17,6 +17,10 @@
 #include <sstream>
 #include <unordered_set>
 
+static void llm_graph_set_op_params_i32(ggml_tensor * tensor, uint32_t i, int32_t value) {
+    memcpy(tensor->op_params + i*sizeof(int32_t), &value, sizeof(value));
+}
+
 // dedup helpers
 
 static ggml_tensor * build_kq_mask(
@@ -1779,30 +1783,252 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+static ggml_tensor * llm_graph_rebuild_split_tbq(
+        ggml_context * ctx,
+        ggml_tensor  * regular,
+        ggml_tensor  * outlier,
+        ggml_tensor  * perm,
+        int64_t        n_embd_head,
+        int64_t        n_head_kv,
+        int64_t        n_outlier_ch) {
+    constexpr int64_t turboq_kv_dim = 128;
+
+    const int64_t n_blocks          = n_embd_head / turboq_kv_dim;
+    const int64_t n_regular_ch      = turboq_kv_dim - n_outlier_ch;
+    const int64_t n_regular_perhead = n_blocks * n_regular_ch;
+    const int64_t n_outlier_perhead = n_blocks * n_outlier_ch;
+    const int64_t n_kv              = regular->ne[1];
+    const int64_t n_stream          = regular->ne[2];
+    const size_t  reg_elem_size     = ggml_element_size(regular);
+    const size_t  out_elem_size     = ggml_element_size(outlier);
+    const int32_t * perm_data       = perm && perm->data ? (const int32_t *) perm->data : nullptr;
+
+    regular = ggml_view_3d(ctx, regular, n_regular_perhead * n_head_kv, n_kv, n_stream, regular->nb[1], regular->nb[2], 0);
+    outlier = ggml_view_3d(ctx, outlier, n_outlier_perhead * n_head_kv, n_kv, n_stream, outlier->nb[1], outlier->nb[2], 0);
+
+    ggml_tensor * full = nullptr;
+
+    for (int64_t h = 0; h < n_head_kv; ++h) {
+        ggml_tensor * head = nullptr;
+        const size_t reg_head_offset = h * n_regular_perhead * reg_elem_size;
+        const size_t out_head_offset = h * n_outlier_perhead * out_elem_size;
+
+        ggml_tensor * reg_head = ggml_view_3d(ctx, regular, n_regular_perhead, n_kv, n_stream, regular->nb[1], regular->nb[2], reg_head_offset);
+        ggml_tensor * out_head = ggml_view_3d(ctx, outlier, n_outlier_perhead, n_kv, n_stream, outlier->nb[1], outlier->nb[2], out_head_offset);
+
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            ggml_tensor * reg_block = ggml_view_3d(ctx, reg_head, n_regular_ch, n_kv, n_stream, reg_head->nb[1], reg_head->nb[2], b * n_regular_ch * reg_elem_size);
+            ggml_tensor * out_block = ggml_view_3d(ctx, out_head, n_outlier_ch, n_kv, n_stream, out_head->nb[1], out_head->nb[2], b * n_outlier_ch * out_elem_size);
+            ggml_tensor * full_block = nullptr;
+
+            if (perm_data != nullptr) {
+                const int64_t block_base = h*n_embd_head + b*turboq_kv_dim;
+                std::array<bool, turboq_kv_dim> is_outlier = {};
+
+                for (int64_t i = n_regular_ch; i < turboq_kv_dim; ++i) {
+                    is_outlier[perm_data[block_base + i] - block_base] = true;
+                }
+
+                int64_t reg_pos = 0;
+                int64_t out_pos = 0;
+
+                for (int64_t i = 0; i < turboq_kv_dim;) {
+                    const bool take_outlier = is_outlier[i];
+                    int64_t run = 1;
+
+                    while (i + run < turboq_kv_dim && is_outlier[i + run] == take_outlier) {
+                        ++run;
+                    }
+
+                    ggml_tensor * block_src = take_outlier ? out_block : reg_block;
+                    const size_t elem_size = take_outlier ? out_elem_size : reg_elem_size;
+                    const int64_t src_pos = take_outlier ? out_pos : reg_pos;
+
+                    ggml_tensor * slice = ggml_view_3d(ctx, block_src, run, n_kv, n_stream, block_src->nb[1], block_src->nb[2], src_pos * elem_size);
+                    full_block = full_block ? ggml_concat(ctx, full_block, slice, 0) : slice;
+
+                    if (take_outlier) {
+                        out_pos += run;
+                    } else {
+                        reg_pos += run;
+                    }
+
+                    i += run;
+                }
+            } else {
+                full_block = ggml_concat(ctx, reg_block, out_block, 0);
+            }
+
+            head = head ? ggml_concat(ctx, head, full_block, 0) : full_block;
+        }
+
+        head = ggml_reshape_4d(ctx, head, n_embd_head, 1, n_kv, n_stream);
+        full = full ? ggml_concat(ctx, full, head, 1) : head;
+    }
+
+    return full;
+}
+
+static ggml_tensor * llm_graph_restore_packed_tbq(
+        ggml_context * ctx,
+        ggml_tensor  * packed,
+        ggml_tensor  * perm,
+        int64_t        n_embd_head,
+        int64_t        n_head_kv) {
+    constexpr int64_t turboq_kv_dim = 128;
+
+    const int64_t n_blocks      = n_embd_head / turboq_kv_dim;
+    const int64_t n_kv          = packed->ne[1];
+    const int64_t n_stream      = packed->ne[2];
+    const size_t  elem_size     = ggml_element_size(packed);
+    const int32_t * perm_data   = perm && perm->data ? (const int32_t *) perm->data : nullptr;
+
+    GGML_ASSERT(n_embd_head % turboq_kv_dim == 0);
+    GGML_ASSERT(packed->ne[0] == n_embd_head * n_head_kv);
+
+    ggml_tensor * full = nullptr;
+
+    for (int64_t h = 0; h < n_head_kv; ++h) {
+        ggml_tensor * head = nullptr;
+        ggml_tensor * packed_head = ggml_view_3d(
+                ctx, packed, n_embd_head, n_kv, n_stream,
+                packed->nb[1], packed->nb[2], h * n_embd_head * elem_size);
+
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            const int64_t block_base = b * turboq_kv_dim;
+            ggml_tensor * packed_block = ggml_view_3d(
+                    ctx, packed_head, turboq_kv_dim, n_kv, n_stream,
+                    packed_head->nb[1], packed_head->nb[2], block_base * elem_size);
+            ggml_tensor * full_block = nullptr;
+
+            if (perm_data != nullptr) {
+                const int32_t * perm_head = perm_data + h * n_embd_head;
+                std::array<int32_t, turboq_kv_dim> inv_perm = {};
+
+                for (int64_t i = 0; i < turboq_kv_dim; ++i) {
+                    inv_perm[perm_head[block_base + i] - block_base] = i;
+                }
+
+                int64_t run_start = 0;
+
+                for (int64_t i = 1; i <= turboq_kv_dim; ++i) {
+                    const bool contiguous = i < turboq_kv_dim &&
+                        inv_perm[i] == inv_perm[i - 1] + 1;
+
+                    if (contiguous) {
+                        continue;
+                    }
+
+                    const int64_t run_len = i - run_start;
+                    const size_t offset = inv_perm[run_start] * elem_size;
+                    ggml_tensor * slice = ggml_view_3d(
+                            ctx, packed_block, run_len, n_kv, n_stream,
+                            packed_block->nb[1], packed_block->nb[2], offset);
+                    full_block = full_block ? ggml_concat(ctx, full_block, slice, 0) : slice;
+                    run_start = i;
+                }
+            } else {
+                full_block = packed_block;
+            }
+
+            head = head ? ggml_concat(ctx, head, full_block, 0) : full_block;
+        }
+
+        head = ggml_reshape_4d(ctx, head, n_embd_head, 1, n_kv, n_stream);
+        full = full ? ggml_concat(ctx, full, head, 1) : head;
+    }
+
+    return full;
+}
+
+static ggml_tensor * llm_graph_view_tbq_split_for_fattn(
+        ggml_context * ctx,
+        ggml_tensor  * src,
+        int64_t        n_embd_head,
+        int64_t        n_head_kv) {
+    return ggml_view_4d(ctx, src, n_embd_head, n_head_kv, src->ne[1], src->ne[2], 0, src->nb[1], src->nb[2], 0);
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
          ggml_tensor * v,
+         ggml_tensor * k_out,
+         ggml_tensor * v_out,
+         ggml_tensor * k_perm,
+         ggml_tensor * v_perm,
          ggml_tensor * kq_b,
          ggml_tensor * kq_mask,
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il) const {
+    const bool k_is_split = k_out != nullptr;
+    const bool v_is_split = v_out != nullptr;
     const bool v_trans = v->nb[1] > v->nb[2];
-    const bool k_is_tbq = k->type == GGML_TYPE_TBQ3_0 || k->type == GGML_TYPE_TBQ4_0;
-    const bool v_is_tbq = v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0;
+    const bool k_is_tbq = k->type == GGML_TYPE_TBQ3_0 || k->type == GGML_TYPE_TBQ4_0 || k->type == GGML_TYPE_TBQ34_0 ||
+        k->type == GGML_TYPE_TBQP3_0 || k->type == GGML_TYPE_TBQP4_0 || k->type == GGML_TYPE_TBQP34_0;
+    const bool v_is_tbq = v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0 || v->type == GGML_TYPE_TBQ34_0 ||
+        v->type == GGML_TYPE_TBQP3_0 || v->type == GGML_TYPE_TBQP4_0 || v->type == GGML_TYPE_TBQP34_0;
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     const enum ggml_type tbq_attn_type = use_flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
-
+    const bool k_tbqp_cpu_flash = use_flash_attn &&
+        !k_is_split &&
+        (k->type == GGML_TYPE_TBQP3_0 || k->type == GGML_TYPE_TBQP4_0 || k->type == GGML_TYPE_TBQP34_0) &&
+        k->buffer != nullptr && ggml_backend_buffer_is_host(k->buffer);
+    const bool k_tbqp_split_cpu_flash = use_flash_attn &&
+        k_is_split &&
+        (k->type == GGML_TYPE_TBQP3_0 || k->type == GGML_TYPE_TBQP4_0) &&
+        (k_out->type == GGML_TYPE_TBQP3_0 || k_out->type == GGML_TYPE_TBQP4_0) &&
+        k->buffer != nullptr && ggml_backend_buffer_is_host(k->buffer) &&
+        k_out->buffer != nullptr && ggml_backend_buffer_is_host(k_out->buffer);
+    const bool v_tbq_cpu_flash = use_flash_attn && !v_is_split && v_is_tbq &&
+        v->buffer != nullptr && ggml_backend_buffer_is_host(v->buffer);
+    const bool v_tbq_split_cpu_flash = use_flash_attn && v_is_split && v_is_tbq &&
+        v->buffer != nullptr && ggml_backend_buffer_is_host(v->buffer) &&
+        v_out->buffer != nullptr && ggml_backend_buffer_is_host(v_out->buffer);
+    const int64_t n_embd_v_reg_split = v_is_split ? v->ne[0] : 0;
+    const int64_t n_embd_v_out_split = v_is_split ? v_out->ne[0] : 0;
     // split the batch into streams if needed
     const auto n_stream = k_is_tbq ? k->ne[2] : (v_is_tbq ? v->ne[2] : k->ne[3]);
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
-    if (k_is_tbq) {
+    if (k_is_split) {
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+        const int64_t n_embd_head = hparams.n_embd_head_k(il);
+        const int64_t n_outlier = cparams.n_outlier_k_ch;
+        const int64_t n_embd_k_reg = k->ne[0];
+        const int64_t n_embd_k_out = k_out->ne[0];
+
+        if (k_tbqp_split_cpu_flash) {
+            k = llm_graph_view_tbq_split_for_fattn(ctx0, k, n_embd_k_reg, n_head_kv);
+            k_out = llm_graph_view_tbq_split_for_fattn(ctx0, k_out, n_embd_k_out, n_head_kv);
+            cb(k, "k_tbqp_split_quantized", il);
+            cb(k_out, "k_tbqp_split_outlier", il);
+        } else {
+            k = ggml_cast(ctx0, k, tbq_attn_type);
+            k_out = ggml_cast(ctx0, k_out, tbq_attn_type);
+            cb(k, use_flash_attn ? "k_tbq_split_f16" : "k_tbq_split_f32", il);
+            cb(k_out, use_flash_attn ? "k_tbq_out_f16" : "k_tbq_out_f32", il);
+
+            k = llm_graph_rebuild_split_tbq(ctx0, k, k_out, k_perm, n_embd_head, n_head_kv, n_outlier);
+            cb(k, "k_tbq_split_reshaped", il);
+            k_out = nullptr;
+        }
+    } else if (k_tbqp_cpu_flash) {
         const int64_t n_head_kv = hparams.n_head_kv(il);
         const int64_t n_embd_k_gqa = k->ne[0];
+
+        GGML_ASSERT(n_head_kv > 0);
+        GGML_ASSERT(n_embd_k_gqa % n_head_kv == 0);
+
+        k = ggml_view_4d(ctx0, k, n_embd_k_gqa, n_head_kv, k->ne[1], k->ne[2], 0, k->nb[1], k->nb[2], 0);
+        cb(k, "k_tbqp_quantized", il);
+    } else if (k_is_tbq) {
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+        const int64_t n_embd_k_gqa = k->ne[0];
+        const enum ggml_type k_src_type = k->type;
 
         GGML_ASSERT(n_head_kv > 0);
         GGML_ASSERT(n_embd_k_gqa % n_head_kv == 0);
@@ -1810,27 +2036,67 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         k = ggml_cast(ctx0, k, tbq_attn_type);
         cb(k, use_flash_attn ? "k_tbq_f16" : "k_tbq_f32", il);
 
-        k = ggml_reshape_4d(ctx0, k, n_embd_k_gqa / n_head_kv, n_head_kv, k->ne[1], k->ne[2]);
+        if (k_src_type == GGML_TYPE_TBQ34_0 || k_src_type == GGML_TYPE_TBQP34_0) {
+            k = llm_graph_restore_packed_tbq(ctx0, k, k_perm, n_embd_k_gqa / n_head_kv, n_head_kv);
+        } else {
+            k = ggml_reshape_4d(ctx0, k, n_embd_k_gqa / n_head_kv, n_head_kv, k->ne[1], k->ne[2]);
+        }
         cb(k, "k_tbq_reshaped", il);
     }
 
-    if (v_is_tbq) {
+    if (v_is_split) {
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+        const int64_t n_embd_head = hparams.n_embd_head_v(il);
+        const int64_t n_outlier = cparams.n_outlier_v_ch;
+
+        if (v_tbq_split_cpu_flash) {
+            v = llm_graph_view_tbq_split_for_fattn(ctx0, v, n_embd_head, n_head_kv);
+            v_out = llm_graph_view_tbq_split_for_fattn(ctx0, v_out, n_embd_head, n_head_kv);
+            cb(v, "v_tbq_split_quantized", il);
+            cb(v_out, "v_tbq_split_outlier", il);
+        } else {
+            v = ggml_cast(ctx0, v, tbq_attn_type);
+            v_out = ggml_cast(ctx0, v_out, tbq_attn_type);
+            cb(v, use_flash_attn ? "v_tbq_split_f16" : "v_tbq_split_f32", il);
+            cb(v_out, use_flash_attn ? "v_tbq_out_f16" : "v_tbq_out_f32", il);
+
+            v = llm_graph_rebuild_split_tbq(ctx0, v, v_out, v_perm, n_embd_head, n_head_kv, n_outlier);
+            cb(v, "v_tbq_split_reshaped", il);
+            v_out = nullptr;
+        }
+    } else if (v_is_tbq) {
         const int64_t n_head_kv = hparams.n_head_kv(il);
         const int64_t n_embd_v_gqa = v->ne[0];
+        const enum ggml_type v_src_type = v->type;
 
         GGML_ASSERT(n_head_kv > 0);
         GGML_ASSERT(n_embd_v_gqa % n_head_kv == 0);
 
-        v = ggml_cast(ctx0, v, tbq_attn_type);
-        cb(v, use_flash_attn ? "v_tbq_f16" : "v_tbq_f32", il);
+        if (v_tbq_cpu_flash) {
+            v = ggml_view_4d(ctx0, v, n_embd_v_gqa / n_head_kv, n_head_kv, v->ne[1], v->ne[2], 0, v->nb[1], v->nb[2], 0);
+            cb(v, "v_tbq_quantized", il);
+        } else {
+            v = ggml_cast(ctx0, v, tbq_attn_type);
+            cb(v, use_flash_attn ? "v_tbq_f16" : "v_tbq_f32", il);
 
-        v = ggml_reshape_4d(ctx0, v, n_embd_v_gqa / n_head_kv, n_head_kv, v->ne[1], v->ne[2]);
-        cb(v, "v_tbq_reshaped", il);
+            if (v_src_type == GGML_TYPE_TBQ34_0 || v_src_type == GGML_TYPE_TBQP34_0) {
+                v = llm_graph_restore_packed_tbq(ctx0, v, v_perm, n_embd_v_gqa / n_head_kv, n_head_kv);
+            } else {
+                v = ggml_reshape_4d(ctx0, v, n_embd_v_gqa / n_head_kv, n_head_kv, v->ne[1], v->ne[2]);
+            }
+            cb(v, "v_tbq_reshaped", il);
+        }
     }
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    if (k_out) {
+        k_out = ggml_permute(ctx0, k_out, 0, 2, 1, 3);
+    }
+    if (v_out) {
+        v_out = ggml_permute(ctx0, v_out, 0, 2, 1, 3);
+    }
 
     ggml_tensor * cur;
 
@@ -1853,6 +2119,28 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
+
+        if (k->type == GGML_TYPE_TBQP34_0) {
+            llm_graph_set_op_params_i32(cur, 4, (int32_t) cparams.n_outlier_k_ch);
+            cur->src[7] = k_perm;
+        }
+        if (v->type == GGML_TYPE_TBQ34_0 || v->type == GGML_TYPE_TBQP34_0) {
+            llm_graph_set_op_params_i32(cur, 5, (int32_t) cparams.n_outlier_v_ch);
+            cur->src[8] = v_perm;
+        }
+
+        if (k_tbqp_split_cpu_flash) {
+            cur->src[5] = k_out;
+            llm_graph_set_op_params_i32(cur, 4, (int32_t) cparams.n_outlier_k_ch);
+            cur->src[7] = k_perm;
+        }
+        if (v_tbq_split_cpu_flash) {
+            cur->src[6] = v_out;
+            llm_graph_set_op_params_i32(cur, 5, (int32_t) cparams.n_outlier_v_ch);
+            llm_graph_set_op_params_i32(cur, 6, (int32_t) n_embd_v_reg_split);
+            llm_graph_set_op_params_i32(cur, 7, (int32_t) n_embd_v_out_split);
+            cur->src[8] = v_perm;
+        }
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
@@ -2000,7 +2288,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, nullptr, nullptr, nullptr, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2087,9 +2375,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k_out = mctx_cur->get_k_out(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * v_out = mctx_cur->get_v_out(ctx0, il);
+    ggml_tensor * k_perm = mctx_cur->get_k_perm(ctx0, il);
+    ggml_tensor * v_perm = mctx_cur->get_v_perm(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, k_out, v_out, k_perm, v_perm, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2172,7 +2464,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, nullptr, nullptr, nullptr, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2237,9 +2529,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k_out = mctx_cur->get_k_out(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * v_out = mctx_cur->get_v_out(ctx0, il);
+    ggml_tensor * k_perm = mctx_cur->get_k_perm(ctx0, il);
+    ggml_tensor * v_perm = mctx_cur->get_v_perm(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, k_out, v_out, k_perm, v_perm, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2294,7 +2590,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, nullptr, nullptr, nullptr, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {

@@ -17,6 +17,10 @@ struct llama_memory_params {
     // kv cache
     ggml_type type_k;
     ggml_type type_v;
+    ggml_type type_k_outlier;
+    ggml_type type_v_outlier;
+    uint32_t n_outlier_k_ch;
+    uint32_t n_outlier_v_ch;
 
     // use full-size SWA cache
     bool swa_full;

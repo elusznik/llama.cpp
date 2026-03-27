@@ -5,13 +5,13 @@
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
+#include "ggml-turboq.h"
 #include "unary-ops.h"
 #include "vec.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
-#include <type_traits>
 #include <vector>
 
 // ggml_compute_forward_dup
@@ -530,6 +530,8 @@ static void ggml_compute_forward_dup_from_q(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    std::vector<float> tmp(qk);
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
 
         uint32_t i = ir * qk;
@@ -546,19 +548,11 @@ static void ggml_compute_forward_dup_from_q(
         const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
         const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
 
-        if constexpr (std::is_same_v<dst_t, float>) {
-            dequantize_row_q(
-                    (const void *) ((char *) src0->data + x_offset),
-                    (float *) ((char *) dst->data + dst_offset), qk);
-        } else {
-            std::vector<float> tmp(qk);
+        dequantize_row_q(
+                (const void *) ((char *) src0->data + x_offset),
+                tmp.data(), qk);
 
-            dequantize_row_q(
-                    (const void *) ((char *) src0->data + x_offset),
-                    tmp.data(), qk);
-
-            ggml_dup_from_float_row(tmp.data(), (dst_t *) ((char *) dst->data + dst_offset), qk);
-        }
+        ggml_dup_from_float_row(tmp.data(), (dst_t *) ((char *) dst->data + dst_offset), qk);
     }
 }
 
@@ -729,6 +723,10 @@ void ggml_compute_forward_add(
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQP3_0:
+        case GGML_TYPE_TBQP4_0:
+        case GGML_TYPE_TBQ34_0:
+        case GGML_TYPE_TBQP34_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -1181,6 +1179,10 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQP3_0:
+        case GGML_TYPE_TBQP4_0:
+        case GGML_TYPE_TBQ34_0:
+        case GGML_TYPE_TBQP34_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -1312,6 +1314,10 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQP3_0:
+        case GGML_TYPE_TBQP4_0:
+        case GGML_TYPE_TBQ34_0:
+        case GGML_TYPE_TBQP34_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4402,6 +4408,8 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQP3_0:
+        case GGML_TYPE_TBQP4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4680,6 +4688,8 @@ void ggml_compute_forward_set(
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQP3_0:
+        case GGML_TYPE_TBQP4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4905,6 +4915,8 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQP3_0:
+        case GGML_TYPE_TBQP4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -5632,6 +5644,10 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQP3_0:
+        case GGML_TYPE_TBQP4_0:
+        case GGML_TYPE_TBQ34_0:
+        case GGML_TYPE_TBQP34_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -8234,6 +8250,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * k_out = dst->src[5];
+    const ggml_tensor * v_out = dst->src[6];
+    const ggml_tensor * k_perm = dst->src[7];
+    const ggml_tensor * v_perm = dst->src[8];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8244,9 +8264,23 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
     GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
 
+    const int64_t DQ = neq0;
     const int64_t DK = nek0;
     const int64_t DV = nev0;
     const int64_t N  = neq1;
+    const int64_t DK_out = k_out ? k_out->ne[0] : 0;
+    const int64_t DV_reg_row = v_out ? ggml_get_op_params_i32(dst, 6) : 0;
+    const int64_t DV_out_row = v_out ? ggml_get_op_params_i32(dst, 7) : 0;
+    const int32_t n_outlier_k_ch = (k_out || k_perm) ? ggml_get_op_params_i32(dst, 4) : 0;
+    const int32_t n_outlier_v_ch = (v_out || v_perm) ? ggml_get_op_params_i32(dst, 5) : 0;
+    const bool k_is_tbqp_full = (k->type == GGML_TYPE_TBQP3_0 || k->type == GGML_TYPE_TBQP4_0) && DK != DQ;
+    const bool k_is_tbqp_mixed = k_perm != nullptr && k->type == GGML_TYPE_TBQP34_0;
+    const bool k_is_tbqp_split = k_out != nullptr &&
+        (k->type == GGML_TYPE_TBQP3_0 || k->type == GGML_TYPE_TBQP4_0) &&
+        (k_out->type == GGML_TYPE_TBQP3_0 || k_out->type == GGML_TYPE_TBQP4_0);
+    const bool v_is_tbq_full = ggml_is_quantized(v->type) && nbv2 == 0 && v_out == nullptr;
+    const bool v_is_tbq_mixed = v_perm != nullptr && (v->type == GGML_TYPE_TBQ34_0 || v->type == GGML_TYPE_TBQP34_0);
+    const bool v_is_tbq_split = v_out != nullptr && ggml_is_quantized(v->type) && ggml_is_quantized(v_out->type);
 
     GGML_ASSERT(ne0 == DV);
     GGML_ASSERT(ne2 == N);
@@ -8256,9 +8290,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
     GGML_ASSERT(nbv0 == ggml_type_size(v->type));
 
-    GGML_ASSERT(neq0 == DK);
     GGML_ASSERT(nek0 == DK);
     GGML_ASSERT(nev0 == DV);
+    GGML_ASSERT(!k_is_tbqp_full || DK % DQ == 0);
+    GGML_ASSERT(!k_is_tbqp_mixed || DQ % 128 == 0);
+    GGML_ASSERT(!k_is_tbqp_split || DQ % 128 == 0);
+    GGML_ASSERT(!v_is_tbq_mixed || DV % 128 == 0);
+    GGML_ASSERT(!v_is_tbq_split || DV % 128 == 0);
+    GGML_ASSERT((k_is_tbqp_full || k_is_tbqp_mixed || k_is_tbqp_split) || DQ == DK);
 
     GGML_ASSERT(neq1 == N);
 
@@ -8294,6 +8333,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+    const int32_t * k_perm_data = k_perm ? (const int32_t *) k_perm->data : nullptr;
+    const int32_t * v_perm_data = v_perm ? (const int32_t *) v_perm->data : nullptr;
 
     ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
     ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
@@ -8317,10 +8358,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         float S = 0.0f;      // sum
         float M = -INFINITY; // maximum KQ value
 
-        float       * VKQ32 = (float       *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32); // FP32 VKQ accumulator
+        float       * VKQ32 = (float       *) params->wdata + ith*(DK + DK_out + 3*DV + CACHE_LINE_SIZE_F32); // FP32 VKQ accumulator
         float       * V32   =                 (VKQ32 + 1*DV); // (temporary) FP32 V buffer
+        float       * VTMP  =                 (VKQ32 + 2*DV); // (temporary) split V decode buffer
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
-        ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
+        void        * Q_q   = (void        *) (VKQ32 + 3*DV); // (temporary) buffer for Q converted to quantized/FP16
 
         if (v->type == GGML_TYPE_F16) {
             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
@@ -8339,7 +8381,78 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
-        q_to_vec_dot(pq, Q_q, DK);
+        const void  * q_vec = Q_q;
+        const float * q_vec_f32 = pq;
+
+        if (k_is_tbqp_mixed) {
+            constexpr int64_t turboq_kv_dim = 128;
+            const int64_t kv_head = iq2 / rk2;
+            const int64_t n_blocks = DQ / turboq_kv_dim;
+            const int32_t * k_perm_head = k_perm_data ? k_perm_data + kv_head*DQ : nullptr;
+            float * q_mixed = (float *) Q_q;
+            memset(q_mixed, 0, DK*sizeof(float));
+
+            for (int64_t ib = 0; ib < n_blocks; ++ib) {
+                const int64_t q_block = ib * turboq_kv_dim;
+                if (k_perm_head) {
+                    const int32_t * block_perm = k_perm_head + q_block;
+                    for (int64_t i = 0; i < turboq_kv_dim; ++i) {
+                        q_mixed[kv_head*DQ + q_block + i] = pq[block_perm[i]];
+                    }
+                } else {
+                    memcpy(q_mixed + kv_head*DQ + q_block, pq + q_block, turboq_kv_dim*sizeof(float));
+                }
+            }
+
+            q_vec_f32 = q_mixed;
+        } else if (k_is_tbqp_split) {
+            constexpr int64_t turboq_kv_dim = 128;
+            const int64_t n_blocks = DQ / turboq_kv_dim;
+            const int64_t q_reg_dim = n_blocks * (turboq_kv_dim - n_outlier_k_ch);
+            const int64_t q_out_dim = n_blocks * n_outlier_k_ch;
+            const int64_t kv_head = iq2 / rk2;
+            const int32_t * k_perm_head = k_perm_data ? k_perm_data + kv_head*DQ : nullptr;
+            float * q_reg_full = (float *) Q_q;
+            float * q_out_full = q_reg_full + DK;
+
+            GGML_ASSERT(n_outlier_k_ch > 0 && n_outlier_k_ch < turboq_kv_dim);
+
+            memset(q_reg_full, 0, DK*sizeof(float));
+            memset(q_out_full, 0, DK_out*sizeof(float));
+
+            for (int64_t ib = 0; ib < n_blocks; ++ib) {
+                const int64_t q_block = ib * turboq_kv_dim;
+                const int64_t reg_dst = kv_head * q_reg_dim + ib * (turboq_kv_dim - n_outlier_k_ch);
+                const int64_t out_dst = kv_head * q_out_dim + ib * n_outlier_k_ch;
+
+                if (k_perm_head) {
+                    const int32_t * block_perm = k_perm_head + q_block;
+                    for (int64_t i = 0; i < turboq_kv_dim - n_outlier_k_ch; ++i) {
+                        q_reg_full[reg_dst + i] = pq[block_perm[i]];
+                    }
+                    for (int64_t i = 0; i < n_outlier_k_ch; ++i) {
+                        q_out_full[out_dst + i] = pq[q_block + block_perm[turboq_kv_dim - n_outlier_k_ch + i]];
+                    }
+                } else {
+                    memcpy(q_reg_full + reg_dst, pq + q_block, (turboq_kv_dim - n_outlier_k_ch)*sizeof(float));
+                    memcpy(q_out_full + out_dst, pq + q_block + (turboq_kv_dim - n_outlier_k_ch), n_outlier_k_ch*sizeof(float));
+                }
+            }
+
+            q_vec_f32 = q_reg_full;
+        } else if (k_is_tbqp_full) {
+            float * q_full = (float *) Q_q;
+
+            memset(q_full, 0, DK*sizeof(float));
+
+            const int64_t kv_head = iq2 / rk2;
+            GGML_ASSERT((kv_head + 1)*DQ <= DK);
+
+            memcpy(q_full + kv_head*DQ, pq, DQ*sizeof(float));
+            q_vec_f32 = q_full;
+        } else {
+            q_to_vec_dot(pq, Q_q, DK);
+        }
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
@@ -8354,7 +8467,34 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            if (k_is_tbqp_mixed) {
+                switch (k->type) {
+                    case GGML_TYPE_TBQP34_0: s = turboq_vec_dot_tbqp34_0_f32(DK, k_data, q_vec_f32); break;
+                    default: GGML_ABORT("fatal error");
+                }
+            } else if (k_is_tbqp_split) {
+                const char * k_out_data = (const char *) k_out->data + (ic*k_out->nb[1] + ik2*k_out->nb[2] + ik3*k_out->nb[3]);
+                const float * q_out_full = q_vec_f32 + DK;
+
+                switch (k->type) {
+                    case GGML_TYPE_TBQP3_0: s = turboq_vec_dot_tbqp3_0_f32(DK, k_data, q_vec_f32); break;
+                    case GGML_TYPE_TBQP4_0: s = turboq_vec_dot_tbqp4_0_f32(DK, k_data, q_vec_f32); break;
+                    default: GGML_ABORT("fatal error");
+                }
+                switch (k_out->type) {
+                    case GGML_TYPE_TBQP3_0: s += turboq_vec_dot_tbqp3_0_f32(DK_out, k_out_data, q_out_full); break;
+                    case GGML_TYPE_TBQP4_0: s += turboq_vec_dot_tbqp4_0_f32(DK_out, k_out_data, q_out_full); break;
+                    default: GGML_ABORT("fatal error");
+                }
+            } else if (k_is_tbqp_full) {
+                switch (k->type) {
+                    case GGML_TYPE_TBQP3_0: s = turboq_vec_dot_tbqp3_0_f32(DK, k_data, q_vec_f32); break;
+                    case GGML_TYPE_TBQP4_0: s = turboq_vec_dot_tbqp4_0_f32(DK, k_data, q_vec_f32); break;
+                    default: GGML_ABORT("fatal error");
+                }
+            } else {
+                kq_vec_dot(DK, &s, 0, k_data, 0, q_vec, 0, 1);
+            }
 
             s = s*scale; // scale KQ value
 
@@ -8401,7 +8541,118 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
                 // V += v*expf(s - M)
                 if (v_to_float) {
-                    v_to_float(v_data, V32, DV);
+                    if (v_is_tbq_mixed) {
+                        constexpr int64_t turboq_kv_dim = 128;
+                        const int64_t n_blocks = DV / turboq_kv_dim;
+                        const int64_t head_offset = iv2 * DV;
+                        const int32_t * v_perm_head = v_perm_data ? v_perm_data + iv2*DV : nullptr;
+
+                        for (int64_t ib = 0; ib < n_blocks; ++ib) {
+                            const int64_t dst_offset = ib * turboq_kv_dim;
+
+                            switch (v->type) {
+                                case GGML_TYPE_TBQ34_0:
+                                    turboq_dequantize_slice_tbq34_0_f32(v_data, VTMP, DV, head_offset + dst_offset, turboq_kv_dim);
+                                    break;
+                                case GGML_TYPE_TBQP34_0:
+                                    turboq_dequantize_slice_tbqp34_0_mse_f32(v_data, VTMP, DV, head_offset + dst_offset, turboq_kv_dim);
+                                    break;
+                                default:
+                                    GGML_ABORT("fatal error");
+                            }
+
+                            if (v_perm_head) {
+                                const int32_t * block_perm = v_perm_head + dst_offset;
+                                for (int64_t i = 0; i < turboq_kv_dim; ++i) {
+                                    V32[block_perm[i]] = VTMP[i];
+                                }
+                            } else {
+                                memcpy(V32 + dst_offset, VTMP, turboq_kv_dim*sizeof(float));
+                            }
+                        }
+                    } else if (v_is_tbq_split) {
+                        constexpr int64_t turboq_kv_dim = 128;
+                        const int64_t n_blocks = DV / turboq_kv_dim;
+                        const int64_t v_reg_dim = n_blocks * (turboq_kv_dim - n_outlier_v_ch);
+                        const int64_t v_out_dim = n_blocks * n_outlier_v_ch;
+                        const int64_t reg_head_offset = iv2 * v_reg_dim;
+                        const int64_t out_head_offset = iv2 * v_out_dim;
+                        const int32_t * v_perm_head = v_perm_data ? v_perm_data + iv2*DV : nullptr;
+                        const char * v_out_data = (const char *) v_out->data + (ic*v_out->nb[1] + iv2*v_out->nb[2] + iv3*v_out->nb[3]);
+
+                        GGML_ASSERT(n_outlier_v_ch > 0 && n_outlier_v_ch < turboq_kv_dim);
+
+                        for (int64_t ib = 0; ib < n_blocks; ++ib) {
+                            const int64_t dst_offset = ib * turboq_kv_dim;
+                            const int64_t reg_offset = reg_head_offset + ib * (turboq_kv_dim - n_outlier_v_ch);
+                            const int64_t out_offset = out_head_offset + ib * n_outlier_v_ch;
+
+                            switch (v->type) {
+                                case GGML_TYPE_TBQ3_0:
+                                    turboq_dequantize_slice_tbq3_0_f32(v_data, VTMP, DV_reg_row, reg_offset, turboq_kv_dim - n_outlier_v_ch);
+                                    break;
+                                case GGML_TYPE_TBQ4_0:
+                                    turboq_dequantize_slice_tbq4_0_f32(v_data, VTMP, DV_reg_row, reg_offset, turboq_kv_dim - n_outlier_v_ch);
+                                    break;
+                                case GGML_TYPE_TBQP3_0:
+                                    turboq_dequantize_slice_tbqp3_0_mse_f32(v_data, VTMP, DV_reg_row, reg_offset, turboq_kv_dim - n_outlier_v_ch);
+                                    break;
+                                case GGML_TYPE_TBQP4_0:
+                                    turboq_dequantize_slice_tbqp4_0_mse_f32(v_data, VTMP, DV_reg_row, reg_offset, turboq_kv_dim - n_outlier_v_ch);
+                                    break;
+                                default:
+                                    GGML_ABORT("fatal error");
+                            }
+
+                            switch (v_out->type) {
+                                case GGML_TYPE_TBQ3_0:
+                                    turboq_dequantize_slice_tbq3_0_f32(v_out_data, VTMP + (turboq_kv_dim - n_outlier_v_ch), DV_out_row, out_offset, n_outlier_v_ch);
+                                    break;
+                                case GGML_TYPE_TBQ4_0:
+                                    turboq_dequantize_slice_tbq4_0_f32(v_out_data, VTMP + (turboq_kv_dim - n_outlier_v_ch), DV_out_row, out_offset, n_outlier_v_ch);
+                                    break;
+                                case GGML_TYPE_TBQP3_0:
+                                    turboq_dequantize_slice_tbqp3_0_mse_f32(v_out_data, VTMP + (turboq_kv_dim - n_outlier_v_ch), DV_out_row, out_offset, n_outlier_v_ch);
+                                    break;
+                                case GGML_TYPE_TBQP4_0:
+                                    turboq_dequantize_slice_tbqp4_0_mse_f32(v_out_data, VTMP + (turboq_kv_dim - n_outlier_v_ch), DV_out_row, out_offset, n_outlier_v_ch);
+                                    break;
+                                default:
+                                    GGML_ABORT("fatal error");
+                            }
+
+                            if (v_perm_head) {
+                                const int32_t * block_perm = v_perm_head + dst_offset;
+                                for (int64_t i = 0; i < turboq_kv_dim; ++i) {
+                                    V32[block_perm[i]] = VTMP[i];
+                                }
+                            } else {
+                                memcpy(V32 + dst_offset, VTMP, turboq_kv_dim*sizeof(float));
+                            }
+                        }
+                    } else if (v_is_tbq_full) {
+                        const int64_t row_dim = DV * nev1;
+                        const int64_t head_offset = iv2 * DV;
+
+                        switch (v->type) {
+                            case GGML_TYPE_TBQ3_0:
+                                turboq_dequantize_slice_tbq3_0_f32(v_data, V32, row_dim, head_offset, DV);
+                                break;
+                            case GGML_TYPE_TBQ4_0:
+                                turboq_dequantize_slice_tbq4_0_f32(v_data, V32, row_dim, head_offset, DV);
+                                break;
+                            case GGML_TYPE_TBQP3_0:
+                                turboq_dequantize_slice_tbqp3_0_mse_f32(v_data, V32, row_dim, head_offset, DV);
+                                break;
+                            case GGML_TYPE_TBQP4_0:
+                                turboq_dequantize_slice_tbqp4_0_mse_f32(v_data, V32, row_dim, head_offset, DV);
+                                break;
+                            default:
+                                GGML_ABORT("fatal error");
+                        }
+                    } else {
+                        v_to_float(v_data, V32, DV);
+                    }
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
                 } else {
                     // V is F32
@@ -8758,19 +9009,21 @@ static void ggml_flash_attn_ext_reduce_partials(
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * k_out = dst->src[5];
 
     const int64_t DK        = k->ne[0];
     const int64_t DV        = v->ne[0];
+    const int64_t DK_out    = k_out ? k_out->ne[0] : 0;
     const int64_t nek1      = k->ne[1];
     const int64_t n_q_heads = q->ne[2];
 
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const int64_t wdata_per_thread = DK + 2*DV + CACHE_LINE_SIZE_F32;
+    const int64_t wdata_per_thread = DK + DK_out + 2*DV + CACHE_LINE_SIZE_F32;
     float *       thread_wdata     = (float *) params->wdata + ith * wdata_per_thread;
 
-    const int64_t partials_offset  = nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+    const int64_t partials_offset  = nth * wdata_per_thread;
     const int64_t partial_size     = 2 + DV;
     const float * partials_base    = (const float *) params->wdata + partials_offset;
 
@@ -8826,6 +9079,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * k_out = dst->src[5];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8838,6 +9092,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     const int64_t DK = nek0;
     const int64_t DV = nev0;
+    const int64_t DK_out = k_out ? k_out->ne[0] : 0;
     const int64_t N  = neq1;
 
 
@@ -8875,7 +9130,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
         const int64_t partial_size  = 2 + DV;
-        float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+        float *       partials_base = (float *) params->wdata + nth * (DK + DK_out + 2*DV + CACHE_LINE_SIZE_F32);
 
         const int64_t ic_start = ith * chunk_size;
         const int64_t ic_end   = std::min(ic_start + chunk_size, nek1);

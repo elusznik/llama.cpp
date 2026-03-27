@@ -156,6 +156,8 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TBQ3_0       = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TBQ4_0       = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_TBQP3_0      = 42, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_TBQP4_0      = 43, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -356,6 +358,10 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        enum ggml_type type_k_outlier; // outlier K cache data type [EXPERIMENTAL]
+        enum ggml_type type_v_outlier; // outlier V cache data type [EXPERIMENTAL]
+        uint32_t       n_outlier_k_ch; // outlier K channels per KV head [EXPERIMENTAL]
+        uint32_t       n_outlier_v_ch; // outlier V channels per KV head [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

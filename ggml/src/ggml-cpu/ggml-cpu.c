@@ -402,6 +402,30 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+    [GGML_TYPE_TBQ34_0] = {
+        .from_float               = quantize_row_tbq34_0,
+        .vec_dot                  = ggml_vec_dot_tbq34_0_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TBQP3_0] = {
+        .from_float               = quantize_row_tbqp3_0,
+        .vec_dot                  = ggml_vec_dot_tbqp3_0_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TBQP4_0] = {
+        .from_float               = quantize_row_tbqp4_0,
+        .vec_dot                  = ggml_vec_dot_tbqp4_0_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TBQP34_0] = {
+        .from_float               = quantize_row_tbqp34_0,
+        .vec_dot                  = ggml_vec_dot_tbqp34_0_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
@@ -2899,6 +2923,7 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
                         const int64_t DK = node->src[1]->ne[0];
                         const int64_t DV = node->src[2]->ne[0];
+                        const int64_t DK_out = node->src[5] ? node->src[5]->ne[0] : 0;
 
                         // Tiled flash attention scratch (tile sizes defined in common.h)
                         // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
@@ -2907,7 +2932,7 @@ struct ggml_cplan ggml_graph_plan(
                         // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
                         // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
                         size_t n_chunks = n_tasks;
-                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + DK_out + 3*DV));
 
                         cur += MAX(prefill, decode);
                     } break;

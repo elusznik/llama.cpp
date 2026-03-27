@@ -389,6 +389,8 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q5_1,
     GGML_TYPE_TBQ3_0,
     GGML_TYPE_TBQ4_0,
+    GGML_TYPE_TBQP3_0,
+    GGML_TYPE_TBQP4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2020,6 +2022,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--cache-type-k-outlier"}, "TYPE",
+        string_format(
+            "KV cache outlier data type for K\n"
+            "allowed values: %s\n"
+            "(default: disabled)",
+            get_all_kv_cache_types().c_str()
+        ),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_k_outlier = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_K_OUTLIER").set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--cache-type-v-outlier"}, "TYPE",
+        string_format(
+            "KV cache outlier data type for V\n"
+            "allowed values: %s\n"
+            "(default: disabled)",
+            get_all_kv_cache_types().c_str()
+        ),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_v_outlier = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_V_OUTLIER").set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--cache-outlier-k-channels"}, "N",
+        string_format("number of outlier K channels per 128-wide TurboQuant slice (default: %u)", params.cache_outlier_k_ch),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("outlier K channel count must be non-negative");
+            }
+            params.cache_outlier_k_ch = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_OUTLIER_K_CHANNELS").set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--cache-outlier-v-channels"}, "N",
+        string_format("number of outlier V channels per 128-wide TurboQuant slice (default: %u)", params.cache_outlier_v_ch),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("outlier V channel count must be non-negative");
+            }
+            params.cache_outlier_v_ch = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_OUTLIER_V_CHANNELS").set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BENCH}));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

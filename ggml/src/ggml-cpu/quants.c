@@ -4,6 +4,7 @@
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "ggml-quants.h"
+#include "ggml-turboq.h"
 #include "quants.h"
 
 #include "arch-fallback.h"
@@ -118,6 +119,30 @@ void quantize_row_tbq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
     assert(k % QK_K == 0);
     block_tbq4_0 * GGML_RESTRICT y = vy;
     quantize_row_tbq4_0_ref(x, y, k);
+}
+
+void quantize_row_tbq34_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    block_tbq34_0 * GGML_RESTRICT y = vy;
+    quantize_row_tbq34_0_ref(x, y, k);
+}
+
+void quantize_row_tbqp3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    block_tbqp3_0 * GGML_RESTRICT y = vy;
+    quantize_row_tbqp3_0_ref(x, y, k);
+}
+
+void quantize_row_tbqp4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    block_tbqp4_0 * GGML_RESTRICT y = vy;
+    quantize_row_tbqp4_0_ref(x, y, k);
+}
+
+void quantize_row_tbqp34_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    block_tbqp34_0 * GGML_RESTRICT y = vy;
+    quantize_row_tbqp34_0_ref(x, y, k);
 }
 
 //===================================== Q8_K ==============================================
@@ -544,6 +569,61 @@ void ggml_vec_dot_tbq4_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sumf;
 }
 
+void ggml_vec_dot_tbq34_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    float * tmp = tbq_vd_get_scratch(n);
+    dequantize_row_tbq34_0((const block_tbq34_0 *) vx, tmp, n);
+
+    const block_q8_K * GGML_RESTRICT y = vy;
+    const int nb = n / QK_K;
+
+    float sumf = 0.0f;
+    int64_t idx = 0;
+    for (int i = 0; i < nb; ++i) {
+        const float d = y[i].d;
+        for (int j = 0; j < QK_K; ++j) {
+            sumf += tmp[idx] * (d * y[i].qs[j]);
+            idx++;
+        }
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tbqp3_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    *s = turboq_vec_dot_tbqp3_0_q8_K(n, vx, vy);
+}
+
+void ggml_vec_dot_tbqp4_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    *s = turboq_vec_dot_tbqp4_0_q8_K(n, vx, vy);
+}
+
+void ggml_vec_dot_tbqp34_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    *s = turboq_vec_dot_tbqp34_0_q8_K(n, vx, vy);
+}
 
 void ggml_vec_dot_q2_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);

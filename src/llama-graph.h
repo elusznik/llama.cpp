@@ -869,6 +869,10 @@ struct llm_graph_context {
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans == false)
+            ggml_tensor * k_out,   // optional outlier K tensor
+            ggml_tensor * v_out,   // optional outlier V tensor
+            ggml_tensor * k_perm,  // optional split K channel order
+            ggml_tensor * v_perm,  // optional split V channel order
             ggml_tensor * kq_b,
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]

@@ -13,6 +13,12 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+struct llama_kv_split_perm {
+    std::vector<int32_t> local;
+    std::vector<int32_t> regular;
+    std::vector<int32_t> outlier;
+};
+
 //
 // llama_kv_cache
 //
@@ -97,6 +103,10 @@ public:
             const llama_model & model,
                     ggml_type   type_k,
                     ggml_type   type_v,
+                    ggml_type   type_k_outlier,
+                    ggml_type   type_v_outlier,
+                    uint32_t    n_outlier_k_ch,
+                    uint32_t    n_outlier_v_ch,
                          bool   v_trans,
                          bool   offload,
                          bool   unified,
@@ -160,7 +170,11 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k_out(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_v_out(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k_perm(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_perm(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -209,10 +223,19 @@ private:
         uint32_t il;
 
         ggml_tensor * k;
+        ggml_tensor * k_out;
         ggml_tensor * v;
+        ggml_tensor * v_out;
 
         std::vector<ggml_tensor *> k_stream;
+        std::vector<ggml_tensor *> k_out_stream;
         std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> v_out_stream;
+
+        uint32_t n_outlier_k_ch = 0;
+        uint32_t n_outlier_v_ch = 0;
+        llama_kv_split_perm k_perm;
+        llama_kv_split_perm v_perm;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -251,6 +274,10 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    bool has_k_outlier(int32_t il) const;
+    bool has_v_outlier(int32_t il) const;
+    void maybe_init_split_perms();
 
     size_t total_size() const;
 
@@ -330,7 +357,11 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_out(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_out(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_perm(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_perm(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be layed out contiguously in memory

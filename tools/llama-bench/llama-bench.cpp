@@ -324,6 +324,10 @@ struct cmd_params {
     std::vector<int>                 n_ubatch;
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
+    std::vector<ggml_type>           type_k_outlier;
+    std::vector<ggml_type>           type_v_outlier;
+    std::vector<int>                 n_outlier_k_ch;
+    std::vector<int>                 n_outlier_v_ch;
     std::vector<int>                 n_threads;
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
@@ -366,6 +370,10 @@ static const cmd_params cmd_params_defaults = {
     /* n_ubatch             */ { 512 },
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
+    /* type_k_outlier       */ { GGML_TYPE_COUNT },
+    /* type_v_outlier       */ { GGML_TYPE_COUNT },
+    /* n_outlier_k_ch       */ { 0 },
+    /* n_outlier_v_ch       */ { 0 },
     /* n_threads            */ { cpu_get_num_math() },
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
@@ -432,6 +440,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ub, --ubatch-size <n>                      (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
     printf("  -ctk, --cache-type-k <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
+    printf("  --cache-type-k-outlier <t>                  (default: none)\n");
+    printf("  --cache-type-v-outlier <t>                  (default: none)\n");
+    printf("  --cache-outlier-k-channels <n>              (default: %s)\n", join(cmd_params_defaults.n_outlier_k_ch, ",").c_str());
+    printf("  --cache-outlier-v-channels <n>              (default: %s)\n", join(cmd_params_defaults.n_outlier_v_ch, ",").c_str());
     printf("  -t, --threads <n>                           (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                    (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                          (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
@@ -488,6 +500,12 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     }
     if (s == "tbq4_0") {
         return GGML_TYPE_TBQ4_0;
+    }
+    if (s == "tbqp3_0") {
+        return GGML_TYPE_TBQP3_0;
+    }
+    if (s == "tbqp4_0") {
+        return GGML_TYPE_TBQP4_0;
     }
 
     return GGML_TYPE_COUNT;
@@ -637,6 +655,60 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.type_v.insert(params.type_v.end(), types.begin(), types.end());
+            } else if (arg == "--cache-type-k-outlier") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+
+                std::vector<ggml_type> types;
+                for (const auto & t : p) {
+                    ggml_type gt = ggml_type_from_name(t);
+                    if (gt == GGML_TYPE_COUNT) {
+                        invalid_param = true;
+                        break;
+                    }
+                    types.push_back(gt);
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.type_k_outlier.insert(params.type_k_outlier.end(), types.begin(), types.end());
+            } else if (arg == "--cache-type-v-outlier") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+
+                std::vector<ggml_type> types;
+                for (const auto & t : p) {
+                    ggml_type gt = ggml_type_from_name(t);
+                    if (gt == GGML_TYPE_COUNT) {
+                        invalid_param = true;
+                        break;
+                    }
+                    types.push_back(gt);
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.type_v_outlier.insert(params.type_v_outlier.end(), types.begin(), types.end());
+            } else if (arg == "--cache-outlier-k-channels") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.n_outlier_k_ch.insert(params.n_outlier_k_ch.end(), p.begin(), p.end());
+            } else if (arg == "--cache-outlier-v-channels") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.n_outlier_v_ch.insert(params.n_outlier_v_ch.end(), p.begin(), p.end());
             } else if (arg == "-dev" || arg == "--device") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1075,6 +1147,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_threads.empty()) {
         params.n_threads = cmd_params_defaults.n_threads;
     }
+    if (params.type_k_outlier.empty()) {
+        params.type_k_outlier = cmd_params_defaults.type_k_outlier;
+    }
+    if (params.type_v_outlier.empty()) {
+        params.type_v_outlier = cmd_params_defaults.type_v_outlier;
+    }
+    if (params.n_outlier_k_ch.empty()) {
+        params.n_outlier_k_ch = cmd_params_defaults.n_outlier_k_ch;
+    }
+    if (params.n_outlier_v_ch.empty()) {
+        params.n_outlier_v_ch = cmd_params_defaults.n_outlier_v_ch;
+    }
     if (params.cpu_mask.empty()) {
         params.cpu_mask = cmd_params_defaults.cpu_mask;
     }
@@ -1097,6 +1181,10 @@ struct cmd_params_instance {
     int                n_ubatch;
     ggml_type          type_k;
     ggml_type          type_v;
+    ggml_type          type_k_outlier;
+    ggml_type          type_v_outlier;
+    int                n_outlier_k_ch;
+    int                n_outlier_v_ch;
     int                n_threads;
     std::string        cpu_mask;
     bool               cpu_strict;
@@ -1174,7 +1262,10 @@ struct cmd_params_instance {
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
-               devices == other.devices &&
+               devices == other.devices && type_k_outlier == other.type_k_outlier &&
+               type_v_outlier == other.type_v_outlier &&
+               n_outlier_k_ch == other.n_outlier_k_ch &&
+               n_outlier_v_ch == other.n_outlier_v_ch &&
                no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
@@ -1187,6 +1278,10 @@ struct cmd_params_instance {
         cparams.n_ubatch        = n_ubatch;
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
+        cparams.type_k_outlier  = type_k_outlier;
+        cparams.type_v_outlier  = type_v_outlier;
+        cparams.n_outlier_k_ch  = n_outlier_k_ch;
+        cparams.n_outlier_v_ch  = n_outlier_v_ch;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
         cparams.embeddings      = embeddings;
@@ -1219,6 +1314,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nub : params.n_ubatch)
     for (const auto & tk : params.type_k)
     for (const auto & tv : params.type_v)
+    for (const auto & tko : params.type_k_outlier)
+    for (const auto & tvo : params.type_v_outlier)
+    for (const auto & nok : params.n_outlier_k_ch)
+    for (const auto & nov : params.n_outlier_v_ch)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
@@ -1239,6 +1338,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch     = */ nub,
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
+                /* .type_k_outlier = */ tko,
+                /* .type_v_outlier = */ tvo,
+                /* .n_outlier_k_ch = */ nok,
+                /* .n_outlier_v_ch = */ nov,
                 /* .n_threads    = */ nt,
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
@@ -1274,6 +1377,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch     = */ nub,
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
+                /* .type_k_outlier = */ tko,
+                /* .type_v_outlier = */ tvo,
+                /* .n_outlier_k_ch = */ nok,
+                /* .n_outlier_v_ch = */ nov,
                 /* .n_threads    = */ nt,
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
@@ -1309,6 +1416,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch     = */ nub,
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
+                /* .type_k_outlier = */ tko,
+                /* .type_v_outlier = */ tvo,
+                /* .n_outlier_k_ch = */ nok,
+                /* .n_outlier_v_ch = */ nov,
                 /* .n_threads    = */ nt,
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
@@ -1353,6 +1464,10 @@ struct test {
     int                      poll;
     ggml_type                type_k;
     ggml_type                type_v;
+    ggml_type                type_k_outlier;
+    ggml_type                type_v_outlier;
+    int                      n_outlier_k_ch;
+    int                      n_outlier_v_ch;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
     llama_split_mode         split_mode;
@@ -1391,6 +1506,10 @@ struct test {
         poll           = inst.poll;
         type_k         = inst.type_k;
         type_v         = inst.type_v;
+        type_k_outlier = inst.type_k_outlier;
+        type_v_outlier = inst.type_v_outlier;
+        n_outlier_k_ch = inst.n_outlier_k_ch;
+        n_outlier_v_ch = inst.n_outlier_v_ch;
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
         split_mode     = inst.split_mode;
@@ -1459,7 +1578,8 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "type_k_outlier","type_v_outlier", "n_outlier_k_ch",
+            "n_outlier_v_ch", "n_gpu_layers",   "n_cpu_moe",     "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "n_prompt",      "n_gen",          "n_depth",
@@ -1475,6 +1595,9 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe") {
+            return INT;
+        }
+        if (field == "n_outlier_k_ch" || field == "n_outlier_v_ch") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
@@ -1541,6 +1664,10 @@ struct test {
                                             std::to_string(poll),
                                             ggml_type_name(type_k),
                                             ggml_type_name(type_v),
+                                            ggml_type_name(type_k_outlier),
+                                            ggml_type_name(type_v_outlier),
+                                            std::to_string(n_outlier_k_ch),
+                                            std::to_string(n_outlier_v_ch),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
                                             split_mode_str(split_mode),

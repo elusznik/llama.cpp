@@ -511,6 +511,12 @@ static void unpack_3bit(uint8_t * indices, const uint8_t * src, int64_t n) {
     }
 }
 
+#define TURBOQ_MIXED_OUTLIER_CH 64
+#define TURBOQ_MIXED_REGULAR_CH (TURBOQ_KV_DIM - TURBOQ_MIXED_OUTLIER_CH)
+#define TURBOQ_MIXED_HALF_COUNT (QK_K / TURBOQ_KV_DIM)
+#define TURBOQ_MIXED_TOTAL_REGULAR (TURBOQ_MIXED_HALF_COUNT * TURBOQ_MIXED_REGULAR_CH)
+#define TURBOQ_MIXED_TOTAL_OUTLIER (TURBOQ_MIXED_HALF_COUNT * TURBOQ_MIXED_OUTLIER_CH)
+
 // ---------------------------------------------------------------------------
 // TBQ3_0: TurboQuant 3-bit
 // ---------------------------------------------------------------------------
@@ -573,6 +579,37 @@ void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RE
 
         for (int64_t j = 0; j < QK_K; ++j) {
             y[b * QK_K + j] = unit_approx[j] * norm;
+        }
+    }
+}
+
+void turboq_dequantize_slice_tbq3_0_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n) {
+    (void) k;
+    assert(k % QK_K == 0);
+    assert(offset >= 0 && n >= 0 && offset + n <= k);
+
+    const block_tbq3_0 * x = (const block_tbq3_0 *) vx;
+    const uint64_t seed = turboq_seed_from_row(0);
+    float * rotated = turboq_get_scratch(QK_K);
+    float * unit_approx = turboq_get_scratch2(QK_K);
+    uint8_t indices[QK_K];
+
+    int64_t out = 0;
+    for (int64_t b = offset / QK_K; out < n; ++b) {
+        const int64_t block_start = b * QK_K;
+        const int64_t start = offset > block_start ? offset - block_start : 0;
+        const int64_t end = (offset + n) < (block_start + QK_K) ? (offset + n) - block_start : QK_K;
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+
+        unpack_3bit(indices, x[b].qs, QK_K);
+        for (int64_t j = 0; j < QK_K; ++j) {
+            rotated[j] = turboq_codebook_3bit[indices[j]] * turboq_block_scale_down();
+        }
+
+        turboq_rotate_block_inverse(unit_approx, rotated, seed);
+
+        for (int64_t j = start; j < end; ++j) {
+            y[out++] = unit_approx[j] * norm;
         }
     }
 }
@@ -666,6 +703,37 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+void turboq_dequantize_slice_tbq4_0_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n) {
+    (void) k;
+    assert(k % QK_K == 0);
+    assert(offset >= 0 && n >= 0 && offset + n <= k);
+
+    const block_tbq4_0 * x = (const block_tbq4_0 *) vx;
+    const uint64_t seed = turboq_seed_from_row(0);
+    float * rotated = turboq_get_scratch(QK_K);
+    float * unit_approx = turboq_get_scratch2(QK_K);
+
+    int64_t out = 0;
+    for (int64_t b = offset / QK_K; out < n; ++b) {
+        const int64_t block_start = b * QK_K;
+        const int64_t start = offset > block_start ? offset - block_start : 0;
+        const int64_t end = (offset + n) < (block_start + QK_K) ? (offset + n) - block_start : QK_K;
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+
+        for (int64_t j = 0; j < QK_K; ++j) {
+            const uint8_t byte = x[b].qs[j / 2];
+            const uint8_t idx = (j & 1) ? (byte >> 4) : (byte & 0x0f);
+            rotated[j] = turboq_codebook_4bit[idx] * turboq_block_scale_down();
+        }
+
+        turboq_rotate_block_inverse(unit_approx, rotated, seed);
+
+        for (int64_t j = start; j < end; ++j) {
+            y[out++] = unit_approx[j] * norm;
+        }
+    }
+}
+
 size_t quantize_tbq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
     (void)imatrix;
     assert(n_per_row % QK_K == 0);
@@ -679,4 +747,977 @@ size_t quantize_tbq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
         quantize_row_tbq4_0_ref(row_src, row_dst, n_per_row);
     }
     return nrows * row_size;
+}
+
+// ---------------------------------------------------------------------------
+// TBQ34_0: TurboQuant mixed 3.5-bit (3-bit regular + 4-bit outlier)
+// ---------------------------------------------------------------------------
+
+void quantize_row_tbq34_0_ref(const float * GGML_RESTRICT x, block_tbq34_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    float * unit = turboq_get_scratch(QK_K);
+    float * rotated = turboq_get_scratch2(QK_K);
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_up = turboq_block_scale_up();
+    uint8_t lo_idx[TURBOQ_MIXED_TOTAL_REGULAR];
+    uint8_t hi_idx[TURBOQ_MIXED_TOTAL_OUTLIER];
+
+    for (int64_t b = 0; b < nb; ++b) {
+        const float * xb = x + b * QK_K;
+
+        float norm_sq = 0.0f;
+        for (int64_t j = 0; j < QK_K; ++j) {
+            norm_sq += xb[j] * xb[j];
+        }
+
+        float norm = sqrtf(norm_sq);
+        if (norm < 1e-10f) {
+            norm = 1e-10f;
+        }
+
+        for (int64_t j = 0; j < QK_K; ++j) {
+            unit[j] = xb[j] / norm;
+        }
+
+        turboq_rotate_block_forward(rotated, unit, seed);
+
+        for (int64_t h = 0; h < TURBOQ_MIXED_HALF_COUNT; ++h) {
+            const int64_t src_off = h * TURBOQ_KV_DIM;
+            const int64_t lo_off = h * TURBOQ_MIXED_REGULAR_CH;
+            const int64_t hi_off = h * TURBOQ_MIXED_OUTLIER_CH;
+
+            for (int64_t i = 0; i < TURBOQ_MIXED_REGULAR_CH; ++i) {
+                lo_idx[lo_off + i] = quantize_scalar_3bit(rotated[src_off + i] * scale_up);
+            }
+            for (int64_t i = 0; i < TURBOQ_MIXED_OUTLIER_CH; ++i) {
+                hi_idx[hi_off + i] = quantize_scalar_4bit(rotated[src_off + TURBOQ_MIXED_REGULAR_CH + i] * scale_up);
+            }
+        }
+
+        pack_3bit(y[b].qs_lo, lo_idx, TURBOQ_MIXED_TOTAL_REGULAR);
+        memset(y[b].qs_hi, 0, sizeof(y[b].qs_hi));
+        for (int64_t i = 0; i < TURBOQ_MIXED_TOTAL_OUTLIER; ++i) {
+            const uint8_t idx = hi_idx[i];
+            if ((i & 1) == 0) {
+                y[b].qs_hi[i / 2] = idx;
+            } else {
+                y[b].qs_hi[i / 2] |= (idx << 4);
+            }
+        }
+        y[b].d = GGML_FP32_TO_FP16(norm);
+    }
+}
+
+void dequantize_row_tbq34_0(const block_tbq34_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_down = turboq_block_scale_down();
+    float * rotated = turboq_get_scratch(QK_K);
+    float * unit_approx = turboq_get_scratch2(QK_K);
+    uint8_t lo_idx[TURBOQ_MIXED_TOTAL_REGULAR];
+
+    for (int64_t b = 0; b < nb; ++b) {
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+
+        unpack_3bit(lo_idx, x[b].qs_lo, TURBOQ_MIXED_TOTAL_REGULAR);
+
+        for (int64_t h = 0; h < TURBOQ_MIXED_HALF_COUNT; ++h) {
+            const int64_t dst_off = h * TURBOQ_KV_DIM;
+            const int64_t lo_off = h * TURBOQ_MIXED_REGULAR_CH;
+            const int64_t hi_off = h * TURBOQ_MIXED_OUTLIER_CH;
+
+            for (int64_t i = 0; i < TURBOQ_MIXED_REGULAR_CH; ++i) {
+                rotated[dst_off + i] = turboq_codebook_3bit[lo_idx[lo_off + i]] * scale_down;
+            }
+            for (int64_t i = 0; i < TURBOQ_MIXED_OUTLIER_CH; ++i) {
+                const uint8_t byte = x[b].qs_hi[(hi_off + i) / 2];
+                const uint8_t idx = ((hi_off + i) & 1) ? ((byte >> 4) & 0x0f) : (byte & 0x0f);
+                rotated[dst_off + TURBOQ_MIXED_REGULAR_CH + i] = turboq_codebook_4bit[idx] * scale_down;
+            }
+        }
+
+        turboq_rotate_block_inverse(unit_approx, rotated, seed);
+
+        for (int64_t j = 0; j < QK_K; ++j) {
+            y[b * QK_K + j] = unit_approx[j] * norm;
+        }
+    }
+}
+
+void turboq_dequantize_slice_tbq34_0_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n) {
+    (void) k;
+    assert(k % QK_K == 0);
+    assert(offset >= 0 && n >= 0 && offset + n <= k);
+
+    const block_tbq34_0 * x = (const block_tbq34_0 *) vx;
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_down = turboq_block_scale_down();
+    float * rotated = turboq_get_scratch(QK_K);
+    float * unit_approx = turboq_get_scratch2(QK_K);
+    uint8_t lo_idx[TURBOQ_MIXED_TOTAL_REGULAR];
+
+    int64_t out = 0;
+    for (int64_t b = offset / QK_K; out < n; ++b) {
+        const int64_t block_start = b * QK_K;
+        const int64_t start = offset > block_start ? offset - block_start : 0;
+        const int64_t end = (offset + n) < (block_start + QK_K) ? (offset + n) - block_start : QK_K;
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+
+        unpack_3bit(lo_idx, x[b].qs_lo, TURBOQ_MIXED_TOTAL_REGULAR);
+
+        for (int64_t h = 0; h < TURBOQ_MIXED_HALF_COUNT; ++h) {
+            const int64_t dst_off = h * TURBOQ_KV_DIM;
+            const int64_t lo_off = h * TURBOQ_MIXED_REGULAR_CH;
+            const int64_t hi_off = h * TURBOQ_MIXED_OUTLIER_CH;
+
+            for (int64_t i = 0; i < TURBOQ_MIXED_REGULAR_CH; ++i) {
+                rotated[dst_off + i] = turboq_codebook_3bit[lo_idx[lo_off + i]] * scale_down;
+            }
+            for (int64_t i = 0; i < TURBOQ_MIXED_OUTLIER_CH; ++i) {
+                const uint8_t byte = x[b].qs_hi[(hi_off + i) / 2];
+                const uint8_t idx = ((hi_off + i) & 1) ? ((byte >> 4) & 0x0f) : (byte & 0x0f);
+                rotated[dst_off + TURBOQ_MIXED_REGULAR_CH + i] = turboq_codebook_4bit[idx] * scale_down;
+            }
+        }
+
+        turboq_rotate_block_inverse(unit_approx, rotated, seed);
+
+        for (int64_t j = start; j < end; ++j) {
+            y[out++] = unit_approx[j] * norm;
+        }
+    }
+}
+
+size_t quantize_tbq34_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void) imatrix;
+    assert(n_per_row % QK_K == 0);
+
+    const int64_t nb_per_row = n_per_row / QK_K;
+    const size_t row_size = nb_per_row * sizeof(block_tbq34_0);
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const float * row_src = src + row * n_per_row;
+        block_tbq34_0 * row_dst = (block_tbq34_0 *) ((char *) dst + row * row_size);
+        quantize_row_tbq34_0_ref(row_src, row_dst, n_per_row);
+    }
+
+    return nrows * row_size;
+}
+
+// ---------------------------------------------------------------------------
+// TBQP3_0: TurboQuant Q_prod 3-bit (2-bit MSE + 1-bit QJL)
+//
+// Paper Algorithm 2 (TurboQuant_prod):
+//   1. Quantize unit vector with (b-1)=2-bit MSE codebook
+//   2. Dequantize MSE, inverse-rotate to get x̃_mse
+//   3. Compute residual r = unit_vec - x̃_mse
+//   4. Apply QJL: signs = sign(S · r) where S is d×d raw Gaussian
+//   5. Store residual norm γ = ||r||₂
+//
+// Dequantization:
+//   x̃ = norm · (x̃_mse + √(π/2)/d · γ · S^T · signs)
+// ---------------------------------------------------------------------------
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+void quantize_row_tbqp3_0_ref(const float * GGML_RESTRICT x, block_tbqp3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    float * unit = turboq_get_scratch(QK_K);
+    float * mse_rot = turboq_get_scratch2(QK_K);
+    float * tmp = turboq_get_scratch3(QK_K);
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_up = turboq_block_scale_up();
+    const float scale_down = turboq_block_scale_down();
+    uint8_t indices[QK_K];
+
+    for (int64_t b = 0; b < nb; b++) {
+        const float * xb = x + b * QK_K;
+
+        float norm_sq = 0.0f;
+        for (int64_t i = 0; i < QK_K; ++i) {
+            norm_sq += xb[i] * xb[i];
+        }
+
+        float norm = sqrtf(norm_sq);
+        if (norm < 1e-10f) {
+            norm = 1e-10f;
+        }
+
+        for (int64_t i = 0; i < QK_K; ++i) {
+            unit[i] = xb[i] / norm;
+        }
+
+        turboq_rotate_qk_forward(mse_rot, unit, seed);
+
+        for (int64_t i = 0; i < QK_K; ++i) {
+            indices[i] = quantize_scalar_2bit(mse_rot[i] * scale_up);
+            mse_rot[i] = turboq_codebook_2bit[indices[i]] * scale_down;
+        }
+
+        turboq_rotate_qk_inverse(tmp, mse_rot, seed);
+
+        float gamma_sq = 0.0f;
+        for (int64_t i = 0; i < QK_K; ++i) {
+            unit[i] -= tmp[i];
+            gamma_sq += unit[i] * unit[i];
+        }
+
+        const float gamma = sqrtf(gamma_sq);
+
+        turboq_project_qk(tmp, unit, seed);
+
+        memset(y[b].qs, 0, sizeof(y[b].qs));
+        memset(y[b].signs, 0, sizeof(y[b].signs));
+        for (int64_t j = 0; j < QK_K; j++) {
+            y[b].qs[j / 4] |= (indices[j] << ((j % 4) * 2));
+            if (tmp[j] >= 0.0f) {
+                y[b].signs[j / 8] |= (1 << (j % 8));
+            }
+        }
+        y[b].d = GGML_FP32_TO_FP16(norm);
+        y[b].gamma = GGML_FP32_TO_FP16(gamma);
+    }
+}
+
+void dequantize_row_tbqp3_0(const block_tbqp3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+    float * mse_rot = turboq_get_scratch(QK_K);
+    float * signs_f = turboq_get_scratch2(QK_K);
+    float * mse_unit = turboq_get_scratch3(QK_K);
+
+    for (int64_t b = 0; b < nb; ++b) {
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+        const float gamma = GGML_FP16_TO_FP32(x[b].gamma);
+
+        for (int64_t j = 0; j < QK_K; ++j) {
+            const uint8_t idx = (x[b].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+            mse_rot[j] = turboq_codebook_2bit[idx] * scale_dn;
+            signs_f[j] = ((x[b].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+        }
+
+        turboq_rotate_qk_inverse(mse_unit, mse_rot, seed);
+        turboq_project_qk_inverse(mse_rot, signs_f, seed);
+
+        const float qjl_f = qjl_scale * gamma;
+        for (int64_t j = 0; j < QK_K; ++j) {
+            y[b * QK_K + j] = norm * (mse_unit[j] + qjl_f * mse_rot[j]);
+        }
+    }
+}
+
+static void turboq_dequantize_slice_tbqp3_0_impl(const block_tbqp3_0 * x, float * y, int64_t k, int64_t offset, int64_t n, bool use_qjl) {
+    (void) k;
+    assert(k % QK_K == 0);
+    assert(offset >= 0 && n >= 0 && offset + n <= k);
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+    float * mse_rot = turboq_get_scratch(QK_K);
+    float * tmp = turboq_get_scratch2(QK_K);
+    float * mse_unit = turboq_get_scratch3(QK_K);
+
+    int64_t out = 0;
+    for (int64_t b = offset / QK_K; out < n; ++b) {
+        const int64_t block_start = b * QK_K;
+        const int64_t start = offset > block_start ? offset - block_start : 0;
+        const int64_t end = (offset + n) < (block_start + QK_K) ? (offset + n) - block_start : QK_K;
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+
+        for (int64_t j = 0; j < QK_K; ++j) {
+            const uint8_t idx = (x[b].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+            mse_rot[j] = turboq_codebook_2bit[idx] * scale_dn;
+        }
+
+        turboq_rotate_qk_inverse(mse_unit, mse_rot, seed);
+
+        if (use_qjl) {
+            const float gamma = GGML_FP16_TO_FP32(x[b].gamma);
+            for (int64_t j = 0; j < QK_K; ++j) {
+                tmp[j] = ((x[b].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+            }
+
+            turboq_project_qk_inverse(mse_rot, tmp, seed);
+
+            const float qjl_f = qjl_scale * gamma;
+            for (int64_t j = start; j < end; ++j) {
+                y[out++] = norm * (mse_unit[j] + qjl_f * mse_rot[j]);
+            }
+        } else {
+            for (int64_t j = start; j < end; ++j) {
+                y[out++] = norm * mse_unit[j];
+            }
+        }
+    }
+}
+
+void turboq_dequantize_slice_tbqp3_0_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n) {
+    turboq_dequantize_slice_tbqp3_0_impl((const block_tbqp3_0 *) vx, y, k, offset, n, true);
+}
+
+void turboq_dequantize_slice_tbqp3_0_mse_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n) {
+    turboq_dequantize_slice_tbqp3_0_impl((const block_tbqp3_0 *) vx, y, k, offset, n, false);
+}
+
+size_t quantize_tbqp3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void)imatrix;
+    assert(n_per_row % QK_K == 0);
+    const int64_t nb_per_row = n_per_row / QK_K;
+    const size_t row_size = nb_per_row * sizeof(block_tbqp3_0);
+
+    for (int64_t row = 0; row < nrows; row++) {
+        const float * row_src = src + row * n_per_row;
+        block_tbqp3_0 * row_dst = (block_tbqp3_0 *)((char *)dst + row * row_size);
+        quantize_row_tbqp3_0_ref(row_src, row_dst, n_per_row);
+    }
+    return nrows * row_size;
+}
+
+// ---------------------------------------------------------------------------
+// TBQP4_0: TurboQuant Q_prod 4-bit (3-bit MSE + 1-bit QJL)
+// ---------------------------------------------------------------------------
+
+void quantize_row_tbqp4_0_ref(const float * GGML_RESTRICT x, block_tbqp4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    float * unit = turboq_get_scratch(QK_K);
+    float * mse_rot = turboq_get_scratch2(QK_K);
+    float * tmp = turboq_get_scratch3(QK_K);
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_up = turboq_block_scale_up();
+    const float scale_down = turboq_block_scale_down();
+    uint8_t indices[QK_K];
+
+    for (int64_t b = 0; b < nb; ++b) {
+        const float * xb = x + b * QK_K;
+
+        float norm_sq = 0.0f;
+        for (int64_t i = 0; i < QK_K; ++i) {
+            norm_sq += xb[i] * xb[i];
+        }
+
+        float norm = sqrtf(norm_sq);
+        if (norm < 1e-10f) {
+            norm = 1e-10f;
+        }
+
+        for (int64_t i = 0; i < QK_K; ++i) {
+            unit[i] = xb[i] / norm;
+        }
+
+        turboq_rotate_qk_forward(mse_rot, unit, seed);
+
+        for (int64_t i = 0; i < QK_K; ++i) {
+            indices[i] = quantize_scalar_3bit(mse_rot[i] * scale_up);
+            mse_rot[i] = turboq_codebook_3bit[indices[i]] * scale_down;
+        }
+
+        turboq_rotate_qk_inverse(tmp, mse_rot, seed);
+
+        float gamma_sq = 0.0f;
+        for (int64_t i = 0; i < QK_K; ++i) {
+            unit[i] -= tmp[i];
+            gamma_sq += unit[i] * unit[i];
+        }
+
+        const float gamma = sqrtf(gamma_sq);
+
+        turboq_project_qk(tmp, unit, seed);
+
+        memset(y[b].signs, 0, sizeof(y[b].signs));
+        for (int64_t j = 0; j < QK_K; j++) {
+            if (tmp[j] >= 0.0f) {
+                y[b].signs[j / 8] |= (1 << (j % 8));
+            }
+        }
+        pack_3bit(y[b].qs, indices, QK_K);
+        y[b].d = GGML_FP32_TO_FP16(norm);
+        y[b].gamma = GGML_FP32_TO_FP16(gamma);
+    }
+}
+
+void dequantize_row_tbqp4_0(const block_tbqp4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+    float * mse_rot = turboq_get_scratch(QK_K);
+    float * signs_f = turboq_get_scratch2(QK_K);
+    float * mse_unit = turboq_get_scratch3(QK_K);
+
+    uint8_t indices[QK_K];
+    for (int64_t b = 0; b < nb; b++) {
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+        const float gamma = GGML_FP16_TO_FP32(x[b].gamma);
+
+        unpack_3bit(indices, x[b].qs, QK_K);
+        for (int64_t j = 0; j < QK_K; j++) {
+            mse_rot[j] = turboq_codebook_3bit[indices[j]] * scale_dn;
+            signs_f[j] = ((x[b].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+        }
+
+        turboq_rotate_qk_inverse(mse_unit, mse_rot, seed);
+        turboq_project_qk_inverse(mse_rot, signs_f, seed);
+
+        const float qjl_f = qjl_scale * gamma;
+        for (int64_t j = 0; j < QK_K; ++j) {
+            y[b * QK_K + j] = norm * (mse_unit[j] + qjl_f * mse_rot[j]);
+        }
+    }
+}
+
+static void turboq_dequantize_slice_tbqp4_0_impl(const block_tbqp4_0 * x, float * y, int64_t k, int64_t offset, int64_t n, bool use_qjl) {
+    (void) k;
+    assert(k % QK_K == 0);
+    assert(offset >= 0 && n >= 0 && offset + n <= k);
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+    float * mse_rot = turboq_get_scratch(QK_K);
+    float * tmp = turboq_get_scratch2(QK_K);
+    float * mse_unit = turboq_get_scratch3(QK_K);
+    uint8_t indices[QK_K];
+
+    int64_t out = 0;
+    for (int64_t b = offset / QK_K; out < n; ++b) {
+        const int64_t block_start = b * QK_K;
+        const int64_t start = offset > block_start ? offset - block_start : 0;
+        const int64_t end = (offset + n) < (block_start + QK_K) ? (offset + n) - block_start : QK_K;
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+
+        unpack_3bit(indices, x[b].qs, QK_K);
+        for (int64_t j = 0; j < QK_K; ++j) {
+            mse_rot[j] = turboq_codebook_3bit[indices[j]] * scale_dn;
+        }
+
+        turboq_rotate_qk_inverse(mse_unit, mse_rot, seed);
+
+        if (use_qjl) {
+            const float gamma = GGML_FP16_TO_FP32(x[b].gamma);
+            for (int64_t j = 0; j < QK_K; ++j) {
+                tmp[j] = ((x[b].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+            }
+
+            turboq_project_qk_inverse(mse_rot, tmp, seed);
+
+            const float qjl_f = qjl_scale * gamma;
+            for (int64_t j = start; j < end; ++j) {
+                y[out++] = norm * (mse_unit[j] + qjl_f * mse_rot[j]);
+            }
+        } else {
+            for (int64_t j = start; j < end; ++j) {
+                y[out++] = norm * mse_unit[j];
+            }
+        }
+    }
+}
+
+void turboq_dequantize_slice_tbqp4_0_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n) {
+    turboq_dequantize_slice_tbqp4_0_impl((const block_tbqp4_0 *) vx, y, k, offset, n, true);
+}
+
+void turboq_dequantize_slice_tbqp4_0_mse_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n) {
+    turboq_dequantize_slice_tbqp4_0_impl((const block_tbqp4_0 *) vx, y, k, offset, n, false);
+}
+
+size_t quantize_tbqp4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void)imatrix;
+    assert(n_per_row % QK_K == 0);
+    const int64_t nb_per_row = n_per_row / QK_K;
+    const size_t row_size = nb_per_row * sizeof(block_tbqp4_0);
+
+    for (int64_t row = 0; row < nrows; row++) {
+        const float * row_src = src + row * n_per_row;
+        block_tbqp4_0 * row_dst = (block_tbqp4_0 *)((char *)dst + row * row_size);
+        quantize_row_tbqp4_0_ref(row_src, row_dst, n_per_row);
+    }
+    return nrows * row_size;
+}
+
+// ---------------------------------------------------------------------------
+// TBQP34_0: TurboQuant Q_prod mixed 3.5-bit
+// ---------------------------------------------------------------------------
+
+void quantize_row_tbqp34_0_ref(const float * GGML_RESTRICT x, block_tbqp34_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    float * unit = turboq_get_scratch(QK_K);
+    float * mse_rot = turboq_get_scratch2(QK_K);
+    float * tmp = turboq_get_scratch3(QK_K);
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_up = turboq_block_scale_up();
+    const float scale_down = turboq_block_scale_down();
+    uint8_t lo_idx[TURBOQ_MIXED_TOTAL_REGULAR];
+    uint8_t hi_idx[TURBOQ_MIXED_TOTAL_OUTLIER];
+
+    for (int64_t b = 0; b < nb; ++b) {
+        const float * xb = x + b * QK_K;
+
+        float norm_sq = 0.0f;
+        for (int64_t i = 0; i < QK_K; ++i) {
+            norm_sq += xb[i] * xb[i];
+        }
+
+        float norm = sqrtf(norm_sq);
+        if (norm < 1e-10f) {
+            norm = 1e-10f;
+        }
+
+        for (int64_t i = 0; i < QK_K; ++i) {
+            unit[i] = xb[i] / norm;
+        }
+
+        turboq_rotate_qk_forward(mse_rot, unit, seed);
+
+        for (int64_t h = 0; h < TURBOQ_MIXED_HALF_COUNT; ++h) {
+            const int64_t src_off = h * TURBOQ_KV_DIM;
+            const int64_t lo_off = h * TURBOQ_MIXED_REGULAR_CH;
+            const int64_t hi_off = h * TURBOQ_MIXED_OUTLIER_CH;
+
+            for (int64_t i = 0; i < TURBOQ_MIXED_REGULAR_CH; ++i) {
+                lo_idx[lo_off + i] = quantize_scalar_2bit(mse_rot[src_off + i] * scale_up);
+                mse_rot[src_off + i] = turboq_codebook_2bit[lo_idx[lo_off + i]] * scale_down;
+            }
+            for (int64_t i = 0; i < TURBOQ_MIXED_OUTLIER_CH; ++i) {
+                hi_idx[hi_off + i] = quantize_scalar_3bit(mse_rot[src_off + TURBOQ_MIXED_REGULAR_CH + i] * scale_up);
+                mse_rot[src_off + TURBOQ_MIXED_REGULAR_CH + i] = turboq_codebook_3bit[hi_idx[hi_off + i]] * scale_down;
+            }
+        }
+
+        turboq_rotate_qk_inverse(tmp, mse_rot, seed);
+
+        float gamma_sq = 0.0f;
+        for (int64_t i = 0; i < QK_K; ++i) {
+            unit[i] -= tmp[i];
+            gamma_sq += unit[i] * unit[i];
+        }
+
+        const float gamma = sqrtf(gamma_sq);
+
+        turboq_project_qk(tmp, unit, seed);
+
+        memset(y[b].qs_lo, 0, sizeof(y[b].qs_lo));
+        memset(y[b].signs, 0, sizeof(y[b].signs));
+        for (int64_t i = 0; i < TURBOQ_MIXED_TOTAL_REGULAR; ++i) {
+            y[b].qs_lo[i / 4] |= (lo_idx[i] << ((i % 4) * 2));
+        }
+        pack_3bit(y[b].qs_hi, hi_idx, TURBOQ_MIXED_TOTAL_OUTLIER);
+        for (int64_t j = 0; j < QK_K; ++j) {
+            if (tmp[j] >= 0.0f) {
+                y[b].signs[j / 8] |= (1 << (j % 8));
+            }
+        }
+
+        y[b].d = GGML_FP32_TO_FP16(norm);
+        y[b].gamma = GGML_FP32_TO_FP16(gamma);
+    }
+}
+
+void dequantize_row_tbqp34_0(const block_tbqp34_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+    float * mse_rot = turboq_get_scratch(QK_K);
+    float * signs_f = turboq_get_scratch2(QK_K);
+    float * mse_unit = turboq_get_scratch3(QK_K);
+    uint8_t hi_idx[TURBOQ_MIXED_TOTAL_OUTLIER];
+
+    for (int64_t b = 0; b < nb; ++b) {
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+        const float gamma = GGML_FP16_TO_FP32(x[b].gamma);
+
+        unpack_3bit(hi_idx, x[b].qs_hi, TURBOQ_MIXED_TOTAL_OUTLIER);
+
+        for (int64_t h = 0; h < TURBOQ_MIXED_HALF_COUNT; ++h) {
+            const int64_t dst_off = h * TURBOQ_KV_DIM;
+            const int64_t lo_off = h * TURBOQ_MIXED_REGULAR_CH;
+            const int64_t hi_off = h * TURBOQ_MIXED_OUTLIER_CH;
+
+            for (int64_t i = 0; i < TURBOQ_MIXED_REGULAR_CH; ++i) {
+                const uint8_t idx = (x[b].qs_lo[(lo_off + i) / 4] >> (((lo_off + i) % 4) * 2)) & 0x3;
+                mse_rot[dst_off + i] = turboq_codebook_2bit[idx] * scale_dn;
+            }
+            for (int64_t i = 0; i < TURBOQ_MIXED_OUTLIER_CH; ++i) {
+                mse_rot[dst_off + TURBOQ_MIXED_REGULAR_CH + i] = turboq_codebook_3bit[hi_idx[hi_off + i]] * scale_dn;
+            }
+        }
+
+        for (int64_t j = 0; j < QK_K; ++j) {
+            signs_f[j] = ((x[b].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+        }
+
+        turboq_rotate_qk_inverse(mse_unit, mse_rot, seed);
+        turboq_project_qk_inverse(mse_rot, signs_f, seed);
+
+        const float qjl_f = qjl_scale * gamma;
+        for (int64_t j = 0; j < QK_K; ++j) {
+            y[b * QK_K + j] = norm * (mse_unit[j] + qjl_f * mse_rot[j]);
+        }
+    }
+}
+
+static void turboq_dequantize_slice_tbqp34_0_impl(const block_tbqp34_0 * x, float * y, int64_t k, int64_t offset, int64_t n, bool use_qjl) {
+    (void) k;
+    assert(k % QK_K == 0);
+    assert(offset >= 0 && n >= 0 && offset + n <= k);
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+    float * mse_rot = turboq_get_scratch(QK_K);
+    float * tmp = turboq_get_scratch2(QK_K);
+    float * mse_unit = turboq_get_scratch3(QK_K);
+    uint8_t hi_idx[TURBOQ_MIXED_TOTAL_OUTLIER];
+
+    int64_t out = 0;
+    for (int64_t b = offset / QK_K; out < n; ++b) {
+        const int64_t block_start = b * QK_K;
+        const int64_t start = offset > block_start ? offset - block_start : 0;
+        const int64_t end = (offset + n) < (block_start + QK_K) ? (offset + n) - block_start : QK_K;
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+
+        unpack_3bit(hi_idx, x[b].qs_hi, TURBOQ_MIXED_TOTAL_OUTLIER);
+
+        for (int64_t h = 0; h < TURBOQ_MIXED_HALF_COUNT; ++h) {
+            const int64_t dst_off = h * TURBOQ_KV_DIM;
+            const int64_t lo_off = h * TURBOQ_MIXED_REGULAR_CH;
+            const int64_t hi_off = h * TURBOQ_MIXED_OUTLIER_CH;
+
+            for (int64_t i = 0; i < TURBOQ_MIXED_REGULAR_CH; ++i) {
+                const uint8_t idx = (x[b].qs_lo[(lo_off + i) / 4] >> (((lo_off + i) % 4) * 2)) & 0x3;
+                mse_rot[dst_off + i] = turboq_codebook_2bit[idx] * scale_dn;
+            }
+            for (int64_t i = 0; i < TURBOQ_MIXED_OUTLIER_CH; ++i) {
+                mse_rot[dst_off + TURBOQ_MIXED_REGULAR_CH + i] = turboq_codebook_3bit[hi_idx[hi_off + i]] * scale_dn;
+            }
+        }
+
+        turboq_rotate_qk_inverse(mse_unit, mse_rot, seed);
+
+        if (use_qjl) {
+            const float gamma = GGML_FP16_TO_FP32(x[b].gamma);
+            for (int64_t j = 0; j < QK_K; ++j) {
+                tmp[j] = ((x[b].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+            }
+
+            turboq_project_qk_inverse(mse_rot, tmp, seed);
+
+            const float qjl_f = qjl_scale * gamma;
+            for (int64_t j = start; j < end; ++j) {
+                y[out++] = norm * (mse_unit[j] + qjl_f * mse_rot[j]);
+            }
+        } else {
+            for (int64_t j = start; j < end; ++j) {
+                y[out++] = norm * mse_unit[j];
+            }
+        }
+    }
+}
+
+void turboq_dequantize_slice_tbqp34_0_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n) {
+    turboq_dequantize_slice_tbqp34_0_impl((const block_tbqp34_0 *) vx, y, k, offset, n, true);
+}
+
+void turboq_dequantize_slice_tbqp34_0_mse_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n) {
+    turboq_dequantize_slice_tbqp34_0_impl((const block_tbqp34_0 *) vx, y, k, offset, n, false);
+}
+
+size_t quantize_tbqp34_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void) imatrix;
+    assert(n_per_row % QK_K == 0);
+    const int64_t nb_per_row = n_per_row / QK_K;
+    const size_t row_size = nb_per_row * sizeof(block_tbqp34_0);
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const float * row_src = src + row * n_per_row;
+        block_tbqp34_0 * row_dst = (block_tbqp34_0 *) ((char *) dst + row * row_size);
+        quantize_row_tbqp34_0_ref(row_src, row_dst, n_per_row);
+    }
+
+    return nrows * row_size;
+}
+
+float turboq_vec_dot_tbqp3_0_f32(int n, const void * vx, const float * q) {
+    assert(n % QK_K == 0);
+
+    const block_tbqp3_0 * GGML_RESTRICT x = (const block_tbqp3_0 *) vx;
+    const int nb = n / QK_K;
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+
+    float q_rot[QK_K];
+    float q_proj[QK_K];
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float norm = GGML_FP16_TO_FP32(x[ib].d);
+        const float gamma = GGML_FP16_TO_FP32(x[ib].gamma);
+
+        turboq_rotate_qk_forward(q_rot, q + ib*QK_K, seed);
+        turboq_project_qk(q_proj, q + ib*QK_K, seed);
+
+        float dot_mse = 0.0f;
+        float dot_qjl = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            const uint8_t idx = (x[ib].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+            const float sign = ((x[ib].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+            dot_mse += turboq_codebook_2bit[idx] * scale_dn * q_rot[j];
+            dot_qjl += sign * q_proj[j];
+        }
+
+        sumf += norm * (dot_mse + qjl_scale * gamma * dot_qjl);
+    }
+
+    return sumf;
+}
+
+float turboq_vec_dot_tbqp4_0_f32(int n, const void * vx, const float * q) {
+    assert(n % QK_K == 0);
+
+    const block_tbqp4_0 * GGML_RESTRICT x = (const block_tbqp4_0 *) vx;
+    const int nb = n / QK_K;
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+
+    float q_rot[QK_K];
+    float q_proj[QK_K];
+    uint8_t indices[QK_K];
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float norm = GGML_FP16_TO_FP32(x[ib].d);
+        const float gamma = GGML_FP16_TO_FP32(x[ib].gamma);
+
+        turboq_rotate_qk_forward(q_rot, q + ib*QK_K, seed);
+        turboq_project_qk(q_proj, q + ib*QK_K, seed);
+
+        unpack_3bit(indices, x[ib].qs, QK_K);
+
+        float dot_mse = 0.0f;
+        float dot_qjl = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            const float sign = ((x[ib].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+            dot_mse += turboq_codebook_3bit[indices[j]] * scale_dn * q_rot[j];
+            dot_qjl += sign * q_proj[j];
+        }
+
+        sumf += norm * (dot_mse + qjl_scale * gamma * dot_qjl);
+    }
+
+    return sumf;
+}
+
+float turboq_vec_dot_tbqp34_0_f32(int n, const void * vx, const float * q) {
+    assert(n % QK_K == 0);
+
+    const block_tbqp34_0 * GGML_RESTRICT x = (const block_tbqp34_0 *) vx;
+    const int nb = n / QK_K;
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+
+    float q_rot[QK_K];
+    float q_proj[QK_K];
+    uint8_t hi_idx[TURBOQ_MIXED_TOTAL_OUTLIER];
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float norm = GGML_FP16_TO_FP32(x[ib].d);
+        const float gamma = GGML_FP16_TO_FP32(x[ib].gamma);
+
+        turboq_rotate_qk_forward(q_rot, q + ib * QK_K, seed);
+        turboq_project_qk(q_proj, q + ib * QK_K, seed);
+        unpack_3bit(hi_idx, x[ib].qs_hi, TURBOQ_MIXED_TOTAL_OUTLIER);
+
+        float dot_mse = 0.0f;
+        float dot_qjl = 0.0f;
+
+        for (int h = 0; h < TURBOQ_MIXED_HALF_COUNT; ++h) {
+            const int lo_off = h * TURBOQ_MIXED_REGULAR_CH;
+            const int hi_off = h * TURBOQ_MIXED_OUTLIER_CH;
+            const int q_off = h * TURBOQ_KV_DIM;
+
+            for (int i = 0; i < TURBOQ_MIXED_REGULAR_CH; ++i) {
+                const uint8_t idx = (x[ib].qs_lo[(lo_off + i) / 4] >> (((lo_off + i) % 4) * 2)) & 0x3;
+                dot_mse += turboq_codebook_2bit[idx] * scale_dn * q_rot[q_off + i];
+            }
+            for (int i = 0; i < TURBOQ_MIXED_OUTLIER_CH; ++i) {
+                dot_mse += turboq_codebook_3bit[hi_idx[hi_off + i]] * scale_dn * q_rot[q_off + TURBOQ_MIXED_REGULAR_CH + i];
+            }
+        }
+
+        for (int j = 0; j < QK_K; ++j) {
+            const float sign = ((x[ib].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+            dot_qjl += sign * q_proj[j];
+        }
+
+        sumf += norm * (dot_mse + qjl_scale * gamma * dot_qjl);
+    }
+
+    return sumf;
+}
+
+float turboq_vec_dot_tbqp3_0_q8_K(int n, const void * vx, const void * vy) {
+    assert(n % QK_K == 0);
+
+    const block_tbqp3_0 * GGML_RESTRICT x = (const block_tbqp3_0 *) vx;
+    const block_q8_K    * GGML_RESTRICT y = (const block_q8_K *) vy;
+    const int nb = n / QK_K;
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+
+    float qf[QK_K];
+    float q_rot[QK_K];
+    float q_proj[QK_K];
+    float mse_rot[QK_K];
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float norm = GGML_FP16_TO_FP32(x[ib].d);
+        const float gamma = GGML_FP16_TO_FP32(x[ib].gamma);
+
+        for (int j = 0; j < QK_K; ++j) {
+            qf[j] = y[ib].d * y[ib].qs[j];
+
+            const uint8_t idx = (x[ib].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+            mse_rot[j] = turboq_codebook_2bit[idx] * scale_dn;
+        }
+
+        turboq_rotate_qk_forward(q_rot, qf, seed);
+        turboq_project_qk(q_proj, qf, seed);
+
+        float dot_mse = 0.0f;
+        float dot_qjl = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            const float sign = ((x[ib].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+            dot_mse += mse_rot[j] * q_rot[j];
+            dot_qjl += sign * q_proj[j];
+        }
+
+        sumf += norm * (dot_mse + qjl_scale * gamma * dot_qjl);
+    }
+
+    return sumf;
+}
+
+float turboq_vec_dot_tbqp4_0_q8_K(int n, const void * vx, const void * vy) {
+    assert(n % QK_K == 0);
+
+    const block_tbqp4_0 * GGML_RESTRICT x = (const block_tbqp4_0 *) vx;
+    const block_q8_K    * GGML_RESTRICT y = (const block_q8_K *) vy;
+    const int nb = n / QK_K;
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+
+    float qf[QK_K];
+    float q_rot[QK_K];
+    float q_proj[QK_K];
+    float mse_rot[QK_K];
+    uint8_t indices[QK_K];
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float norm = GGML_FP16_TO_FP32(x[ib].d);
+        const float gamma = GGML_FP16_TO_FP32(x[ib].gamma);
+
+        unpack_3bit(indices, x[ib].qs, QK_K);
+        for (int j = 0; j < QK_K; ++j) {
+            qf[j] = y[ib].d * y[ib].qs[j];
+            mse_rot[j] = turboq_codebook_3bit[indices[j]] * scale_dn;
+        }
+
+        turboq_rotate_qk_forward(q_rot, qf, seed);
+        turboq_project_qk(q_proj, qf, seed);
+
+        float dot_mse = 0.0f;
+        float dot_qjl = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            const float sign = ((x[ib].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+            dot_mse += mse_rot[j] * q_rot[j];
+            dot_qjl += sign * q_proj[j];
+        }
+
+        sumf += norm * (dot_mse + qjl_scale * gamma * dot_qjl);
+    }
+
+    return sumf;
+}
+
+float turboq_vec_dot_tbqp34_0_q8_K(int n, const void * vx, const void * vy) {
+    assert(n % QK_K == 0);
+
+    const block_tbqp34_0 * GGML_RESTRICT x = (const block_tbqp34_0 *) vx;
+    const block_q8_K     * GGML_RESTRICT y = (const block_q8_K *) vy;
+    const int nb = n / QK_K;
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    const float scale_dn = turboq_block_scale_down();
+    const float qjl_scale = sqrtf((float) M_PI / 2.0f) / (float) QK_K;
+
+    float qf[QK_K];
+    float q_rot[QK_K];
+    float q_proj[QK_K];
+    uint8_t hi_idx[TURBOQ_MIXED_TOTAL_OUTLIER];
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float norm = GGML_FP16_TO_FP32(x[ib].d);
+        const float gamma = GGML_FP16_TO_FP32(x[ib].gamma);
+
+        unpack_3bit(hi_idx, x[ib].qs_hi, TURBOQ_MIXED_TOTAL_OUTLIER);
+        for (int j = 0; j < QK_K; ++j) {
+            qf[j] = y[ib].d * y[ib].qs[j];
+        }
+
+        turboq_rotate_qk_forward(q_rot, qf, seed);
+        turboq_project_qk(q_proj, qf, seed);
+
+        float dot_mse = 0.0f;
+        float dot_qjl = 0.0f;
+
+        for (int h = 0; h < TURBOQ_MIXED_HALF_COUNT; ++h) {
+            const int lo_off = h * TURBOQ_MIXED_REGULAR_CH;
+            const int hi_off = h * TURBOQ_MIXED_OUTLIER_CH;
+            const int q_off = h * TURBOQ_KV_DIM;
+
+            for (int i = 0; i < TURBOQ_MIXED_REGULAR_CH; ++i) {
+                const uint8_t idx = (x[ib].qs_lo[(lo_off + i) / 4] >> (((lo_off + i) % 4) * 2)) & 0x3;
+                dot_mse += turboq_codebook_2bit[idx] * scale_dn * q_rot[q_off + i];
+            }
+            for (int i = 0; i < TURBOQ_MIXED_OUTLIER_CH; ++i) {
+                dot_mse += turboq_codebook_3bit[hi_idx[hi_off + i]] * scale_dn * q_rot[q_off + TURBOQ_MIXED_REGULAR_CH + i];
+            }
+        }
+
+        for (int j = 0; j < QK_K; ++j) {
+            const float sign = ((x[ib].signs[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+            dot_qjl += sign * q_proj[j];
+        }
+
+        sumf += norm * (dot_mse + qjl_scale * gamma * dot_qjl);
+    }
+
+    return sumf;
 }
