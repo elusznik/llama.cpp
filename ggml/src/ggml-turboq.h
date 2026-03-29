@@ -16,6 +16,9 @@ void turboq_rotate_inverse(float * x, const float * y, int64_t d, uint64_t seed)
 
 uint64_t turboq_seed_from_row(int64_t row_idx);
 
+const float * turboq_get_rotation(int64_t d, uint64_t seed);
+const float * turboq_get_projection(int64_t d, uint64_t seed);
+
 void turboq_dequantize_slice_tbq3_0_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n);
 void turboq_dequantize_slice_tbq4_0_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n);
 void turboq_dequantize_slice_tbq34_0_f32(const void * vx, float * y, int64_t k, int64_t offset, int64_t n);

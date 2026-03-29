@@ -3,8 +3,13 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "ggml-turboq.h"
 
 #include <cstdint>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
@@ -17,6 +22,58 @@
 // Still, the value range should be shifted as much as necessary but as little as possible.
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
+
+struct turboq_fattn_matrix_cache {
+    float *  d_M  = nullptr;
+    int      d    = 0;
+    uint64_t seed = 0;
+};
+
+static turboq_fattn_matrix_cache g_turboq_fattn_rotation_cache[GGML_CUDA_MAX_DEVICES];
+static turboq_fattn_matrix_cache g_turboq_fattn_projection_cache[GGML_CUDA_MAX_DEVICES];
+
+static const float * ggml_cuda_turboq_get_matrix_device(
+        turboq_fattn_matrix_cache * caches,
+        int d,
+        const float * (*get_host_matrix)(int64_t, uint64_t)) {
+    GGML_ASSERT(d > 0);
+
+    const int device = ggml_cuda_get_device();
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    auto & cache = caches[device];
+    if (cache.d_M != nullptr && cache.d == d && cache.seed == seed) {
+        return cache.d_M;
+    }
+
+    if (cache.d_M != nullptr) {
+        CUDA_CHECK(cudaFree(cache.d_M));
+        cache.d_M = nullptr;
+        cache.d   = 0;
+    }
+
+    const float * M_host = get_host_matrix(d, seed);
+    const size_t size    = size_t(d) * size_t(d) * sizeof(float);
+
+    CUDA_CHECK(cudaMalloc(&cache.d_M, size));
+    CUDA_CHECK(cudaMemcpy(cache.d_M, M_host, size, cudaMemcpyHostToDevice));
+
+    cache.d    = d;
+    cache.seed = seed;
+
+    return cache.d_M;
+}
+
+static const float * ggml_cuda_turboq_get_rotation_device(const int d, cudaStream_t stream) {
+    GGML_UNUSED(stream);
+    return ggml_cuda_turboq_get_matrix_device(g_turboq_fattn_rotation_cache, d, turboq_get_rotation);
+}
+
+static const float * ggml_cuda_turboq_get_projection_device(const int d, cudaStream_t stream) {
+    GGML_UNUSED(stream);
+    return ggml_cuda_turboq_get_matrix_device(g_turboq_fattn_projection_cache, d, turboq_get_projection);
+}
 
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
@@ -39,10 +96,34 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const float * __restrict__ turboq_Q,
+        const float * __restrict__ turboq_S);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
+
+static __device__ __forceinline__ float tbq2_codebook_value_fattn(uint8_t idx) {
+    switch (idx) {
+        case 0: return -1.5104f;
+        case 1: return -0.4529f;
+        case 2: return  0.4529f;
+        default: return  1.5104f;
+    }
+}
+
+static __device__ __forceinline__ float tbq3_codebook_value_fattn(uint8_t idx) {
+    switch (idx) {
+        case 0: return -2.1520f;
+        case 1: return -1.3440f;
+        case 2: return -0.7560f;
+        case 3: return -0.2451f;
+        case 4: return  0.2451f;
+        case 5: return  0.7560f;
+        case 6: return  1.3440f;
+        default: return  2.1520f;
+    }
+}
 
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
@@ -286,6 +367,70 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     }
 
     return sum;
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tbqp3_0 * K_tbqp3 = (const block_tbqp3_0 *) K_c;
+    const float * q_rot = (const float *) Q_v;
+    const float * q_proj = (const float *) Q_ds_v;
+    GGML_UNUSED(Q_q8);
+
+    const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
+    const float norm = __half2float((half) K_tbqp3[0].d);
+    const float gamma = __half2float((half) K_tbqp3[0].gamma);
+    const float scale_down = 1.0f / sqrtf((float) D);
+    const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) D;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i = lane; i < D; i += nthreads) {
+        const int block_idx = i / QK_K;
+        const int in_block = i % QK_K;
+        const uint8_t idx = (K_tbqp3[block_idx].qs[in_block / 4] >> ((in_block % 4) * 2)) & 0x3u;
+        const float sign = ((K_tbqp3[block_idx].signs[in_block / 8] >> (in_block % 8)) & 1u) ? 1.0f : -1.0f;
+
+        sum += q_rot[i] * tbq2_codebook_value_fattn(idx) * scale_down + qjl_f * q_proj[i] * sign;
+    }
+
+    return norm * sum;
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tbqp4_0 * K_tbqp4 = (const block_tbqp4_0 *) K_c;
+    const float * q_rot = (const float *) Q_v;
+    const float * q_proj = (const float *) Q_ds_v;
+    GGML_UNUSED(Q_q8);
+
+    const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
+    const float norm = __half2float((half) K_tbqp4[0].d);
+    const float gamma = __half2float((half) K_tbqp4[0].gamma);
+    const float scale_down = 1.0f / sqrtf((float) D);
+    const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) D;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i = lane; i < D; i += nthreads) {
+        const int block_idx = i / QK_K;
+        const int in_block = i % QK_K;
+        const int group = in_block / 8;
+        const int shift = (in_block % 8) * 3;
+        const uint8_t * qs = K_tbqp4[block_idx].qs + group * 3;
+        const uint32_t bits = uint32_t(qs[0]) | (uint32_t(qs[1]) << 8) | (uint32_t(qs[2]) << 16);
+        const uint8_t idx = (bits >> shift) & 0x7u;
+        const float sign = ((K_tbqp4[block_idx].signs[in_block / 8] >> (in_block % 8)) & 1u) ? 1.0f : -1.0f;
+
+        sum += q_rot[i] * tbq3_codebook_value_fattn(idx) * scale_down + qjl_f * q_proj[i] * sign;
+    }
+
+    return norm * sum;
 }
 
 template <typename Tds, int ni>
@@ -581,6 +726,10 @@ template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQP3_0) {
+        return vec_dot_fattn_vec_KQ_tbqp3<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQP4_0) {
+        return vec_dot_fattn_vec_KQ_tbqp4<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
@@ -874,6 +1023,9 @@ void launch_fattn(
     size_t nb21 = V->nb[1];
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
+    const bool K_is_tbqp = K->type == GGML_TYPE_TBQP3_0 || K->type == GGML_TYPE_TBQP4_0;
+    const float * turboq_Q = nullptr;
+    const float * turboq_S = nullptr;
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
@@ -900,6 +1052,11 @@ void launch_fattn(
             nb13 = K->ne[2] * nb12;
         }
         K_data = (char *) K_f16.ptr;
+    }
+
+    if (!need_f16_K && K_is_tbqp) {
+        turboq_Q = ggml_cuda_turboq_get_rotation_device((int) K->ne[0], main_stream);
+        turboq_S = ggml_cuda_turboq_get_projection_device((int) K->ne[0], main_stream);
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
@@ -1058,7 +1215,8 @@ void launch_fattn(
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        turboq_Q, turboq_S
     );
     CUDA_CHECK(cudaGetLastError());
 

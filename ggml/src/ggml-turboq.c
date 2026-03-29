@@ -170,7 +170,7 @@ static TURBOQ_TLS float * tl_Q_row = NULL;
 static TURBOQ_TLS int64_t tl_Q_dim = 0;
 static TURBOQ_TLS uint64_t tl_Q_seed = 0;
 
-static const float * turboq_get_rotation(int64_t d, uint64_t seed) {
+const float * turboq_get_rotation(int64_t d, uint64_t seed) {
     if (tl_Q != NULL && tl_Q_dim == d && tl_Q_seed == seed) {
         return tl_Q;
     }
@@ -218,7 +218,7 @@ static TURBOQ_TLS float * tl_S_row = NULL;
 static TURBOQ_TLS int64_t tl_S_dim = 0;
 static TURBOQ_TLS uint64_t tl_S_seed = 0;
 
-static const float * turboq_get_projection(int64_t d, uint64_t seed) {
+const float * turboq_get_projection(int64_t d, uint64_t seed) {
     // Use a different seed stream for S vs Q
     uint64_t s_seed = seed ^ 0x1234567890abcdefULL;
     if (tl_S != NULL && tl_S_dim == d && tl_S_seed == s_seed) {

@@ -6,6 +6,12 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+static inline bool ggml_cuda_fattn_uses_f16_staging(const ggml_type type) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ||
+        type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0 ||
+        type == GGML_TYPE_TBQP3_0 || type == GGML_TYPE_TBQP4_0;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -197,14 +203,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
-#define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
-    {                                                                                                            \
-        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
-        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \
-        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \
-            ggml_cuda_flash_attn_ext_vec_case<D, type_K, type_V>(ctx, dst);                                      \
-            return;                                                                                              \
-        }                                                                                                        \
+#define FATTN_VEC_CASE(D, type_K, type_V)                                                                                          \
+    {                                                                                                                              \
+        const bool type_K_okay = K->type == (type_K) || ((type_K) == GGML_TYPE_F16 && ggml_cuda_fattn_uses_f16_staging(K->type)); \
+        const bool type_V_okay = V->type == (type_V) || ((type_V) == GGML_TYPE_F16 && ggml_cuda_fattn_uses_f16_staging(V->type)); \
+        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                                       \
+            ggml_cuda_flash_attn_ext_vec_case<D, type_K, type_V>(ctx, dst);                                                        \
+            return;                                                                                                                 \
+        }                                                                                                                           \
     }                                                                                                            \
 
 #define FATTN_VEC_CASES_ALL_D(type_K, type_V) \
@@ -216,6 +222,9 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
 
 #ifdef GGML_CUDA_FA_ALL_QUANTS
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
@@ -326,6 +335,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+    const bool K_is_tbqp = K->type == GGML_TYPE_TBQP3_0 || K->type == GGML_TYPE_TBQP4_0;
+
+    if (K_is_tbqp) {
+        if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        return BEST_FATTN_KERNEL_NONE;
+    }
 
     switch (K->ne[0]) {
         case  40:
@@ -353,7 +370,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+    if (K->type != V->type &&
+        !(ggml_cuda_fattn_uses_f16_staging(K->type) && ggml_cuda_fattn_uses_f16_staging(V->type))) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -361,6 +379,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     switch (K->type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQP3_0:
+        case GGML_TYPE_TBQP4_0:
             break;
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -508,3 +530,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
+template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_TBQP3_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_TBQP3_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TBQP3_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_TBQP4_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_TBQP4_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TBQP4_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
