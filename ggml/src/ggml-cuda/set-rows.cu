@@ -6,6 +6,8 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+#define TURBOQ_KV_DIM 128
+
 namespace {
 
 struct turboq_matrix_cache {
@@ -169,73 +171,67 @@ static __global__ void k_set_rows_tbq3(
 
     extern __shared__ unsigned char smem[];
     float * s_row = (float *) smem;
-    float * s_reduce = s_row + nc;
+    float * s_reduce = s_row + QK_K;
     uint8_t * s_idx = (uint8_t *) (s_reduce + blockDim.x);
 
-    float norm_sq = 0.0f;
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        const float v = src0_row[i];
-        s_row[i] = v;
-        norm_sq += v * v;
-    }
-
-    s_reduce[tid] = norm_sq;
-    __syncthreads();
-
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_reduce[tid] += s_reduce[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        const float norm = sqrtf(s_reduce[0]);
-        s_reduce[0] = norm < 1e-10f ? 1e-10f : norm;
-    }
-    __syncthreads();
-
-    const float norm = s_reduce[0];
-    const float inv_norm = 1.0f / norm;
-    const float scale_up = sqrtf((float) nc);
+    const float scale_up = sqrtf((float) QK_K);
     const int64_t nb = nc / QK_K;
 
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        s_row[i] *= inv_norm;
-    }
-    __syncthreads();
+    for (int64_t b = 0; b < nb; ++b) {
+        const int64_t base = b * QK_K;
+        const float v = src0_row[base + tid];
+        s_row[tid] = v;
+        s_reduce[tid] = v * v;
+        __syncthreads();
 
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        const float * q_row = Q + i*nc;
+        for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                s_reduce[tid] += s_reduce[tid + stride];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            const float norm = sqrtf(s_reduce[0]);
+            s_reduce[0] = norm < 1e-10f ? 1e-10f : norm;
+            dst_row_ptr[b].d = __float2half(s_reduce[0]);
+        }
+        __syncthreads();
+
+        const float inv_norm = 1.0f / s_reduce[0];
+        s_row[tid] *= inv_norm;
+        __syncthreads();
+
+        const int half = tid / TURBOQ_KV_DIM;
+        const int col  = tid % TURBOQ_KV_DIM;
+        const float * q_col = Q + col * TURBOQ_KV_DIM;
+        const float * x_half = s_row + half * TURBOQ_KV_DIM;
+
         float sum = 0.0f;
-        for (int64_t j = 0; j < nc; ++j) {
-            sum += q_row[j] * s_row[j];
+        for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
+            sum += q_col[j] * x_half[j];
         }
-        s_idx[i] = quantize_tbq3_scalar(sum * scale_up);
-    }
-    __syncthreads();
+        s_idx[tid] = quantize_tbq3_scalar(sum * scale_up);
+        __syncthreads();
 
-    for (int64_t b = tid; b < nb; b += blockDim.x) {
-        dst_row_ptr[b].d = (b == 0) ? __float2half(norm) : __float2half(0.0f);
-    }
+        constexpr int TBQ3_GROUP = 8;
+        constexpr int TBQ3_GROUPS_PER_BLOCK = QK_K / TBQ3_GROUP;
+        if (tid < TBQ3_GROUPS_PER_BLOCK) {
+            const int64_t group_in_block = tid;
+            const int64_t group_base = group_in_block * TBQ3_GROUP;
 
-    constexpr int TBQ3_GROUP = 8;
-    constexpr int TBQ3_GROUPS_PER_BLOCK = QK_K / TBQ3_GROUP;
-    for (int64_t group_idx = tid; group_idx < nb * TBQ3_GROUPS_PER_BLOCK; group_idx += blockDim.x) {
-        const int64_t block_idx = group_idx / TBQ3_GROUPS_PER_BLOCK;
-        const int64_t group_in_block = group_idx % TBQ3_GROUPS_PER_BLOCK;
-        const int64_t base = block_idx * QK_K + group_in_block * TBQ3_GROUP;
+            uint32_t bits = 0;
+            #pragma unroll
+            for (int j = 0; j < TBQ3_GROUP; ++j) {
+                bits |= uint32_t(s_idx[group_base + j] & 0x7u) << (j * 3);
+            }
 
-        uint32_t bits = 0;
-        #pragma unroll
-        for (int j = 0; j < TBQ3_GROUP; ++j) {
-            bits |= uint32_t(s_idx[base + j] & 0x7u) << (j * 3);
+            const int64_t byte_offset = group_in_block * 3;
+            dst_row_ptr[b].qs[byte_offset + 0] = uint8_t(bits & 0xffu);
+            dst_row_ptr[b].qs[byte_offset + 1] = uint8_t((bits >> 8) & 0xffu);
+            dst_row_ptr[b].qs[byte_offset + 2] = uint8_t((bits >> 16) & 0xffu);
         }
-
-        const int64_t byte_offset = group_in_block * 3;
-        dst_row_ptr[block_idx].qs[byte_offset + 0] = uint8_t(bits & 0xffu);
-        dst_row_ptr[block_idx].qs[byte_offset + 1] = uint8_t((bits >> 8) & 0xffu);
-        dst_row_ptr[block_idx].qs[byte_offset + 2] = uint8_t((bits >> 16) & 0xffu);
+        __syncthreads();
     }
 
     GGML_UNUSED(ne10);
@@ -296,63 +292,56 @@ static __global__ void k_set_rows_tbq4(
 
     extern __shared__ unsigned char smem[];
     float * s_row = (float *) smem;
-    float * s_reduce = s_row + nc;
+    float * s_reduce = s_row + QK_K;
     uint8_t * s_idx = (uint8_t *) (s_reduce + blockDim.x);
 
-    float norm_sq = 0.0f;
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        const float v = src0_row[i];
-        s_row[i] = v;
-        norm_sq += v * v;
-    }
-
-    s_reduce[tid] = norm_sq;
-    __syncthreads();
-
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_reduce[tid] += s_reduce[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        const float norm = sqrtf(s_reduce[0]);
-        s_reduce[0] = norm < 1e-10f ? 1e-10f : norm;
-    }
-    __syncthreads();
-
-    const float norm = s_reduce[0];
-    const float inv_norm = 1.0f / norm;
-    const float scale_up = sqrtf((float) nc);
+    const float scale_up = sqrtf((float) QK_K);
     const int64_t nb = nc / QK_K;
 
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        s_row[i] *= inv_norm;
-    }
-    __syncthreads();
+    for (int64_t b = 0; b < nb; ++b) {
+        const int64_t base = b * QK_K;
+        const float v = src0_row[base + tid];
+        s_row[tid] = v;
+        s_reduce[tid] = v * v;
+        __syncthreads();
 
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        const float * q_row = Q + i*nc;
-        float sum = 0.0f;
-        for (int64_t j = 0; j < nc; ++j) {
-            sum += q_row[j] * s_row[j];
+        for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                s_reduce[tid] += s_reduce[tid + stride];
+            }
+            __syncthreads();
         }
-        s_idx[i] = quantize_tbq4_scalar(sum * scale_up);
-    }
-    __syncthreads();
 
-    for (int64_t b = tid; b < nb; b += blockDim.x) {
-        dst_row_ptr[b].d = (b == 0) ? __float2half(norm) : __float2half(0.0f);
-    }
+        if (tid == 0) {
+            const float norm = sqrtf(s_reduce[0]);
+            s_reduce[0] = norm < 1e-10f ? 1e-10f : norm;
+            dst_row_ptr[b].d = __float2half(s_reduce[0]);
+        }
+        __syncthreads();
 
-    for (int64_t byte_idx = tid; byte_idx < nb * (QK_K / 2); byte_idx += blockDim.x) {
-        const int64_t block_idx = byte_idx / (QK_K / 2);
-        const int64_t byte_in_block = byte_idx % (QK_K / 2);
-        const int64_t base = block_idx * QK_K + byte_in_block * 2;
-        const uint8_t lo = s_idx[base + 0] & 0x0fu;
-        const uint8_t hi = s_idx[base + 1] & 0x0fu;
-        dst_row_ptr[block_idx].qs[byte_in_block] = lo | (hi << 4);
+        const float inv_norm = 1.0f / s_reduce[0];
+        s_row[tid] *= inv_norm;
+        __syncthreads();
+
+        const int half = tid / TURBOQ_KV_DIM;
+        const int col  = tid % TURBOQ_KV_DIM;
+        const float * q_col = Q + col * TURBOQ_KV_DIM;
+        const float * x_half = s_row + half * TURBOQ_KV_DIM;
+
+        float sum = 0.0f;
+        for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
+            sum += q_col[j] * x_half[j];
+        }
+        s_idx[tid] = quantize_tbq4_scalar(sum * scale_up);
+        __syncthreads();
+
+        if (tid < QK_K / 2) {
+            const int idx0 = 2 * tid;
+            const uint8_t lo = s_idx[idx0 + 0] & 0x0fu;
+            const uint8_t hi = s_idx[idx0 + 1] & 0x0fu;
+            dst_row_ptr[b].qs[tid] = lo | (hi << 4);
+        }
+        __syncthreads();
     }
 
     GGML_UNUSED(ne10);
@@ -414,127 +403,152 @@ static __global__ void k_set_rows_tbqp3(
 
     extern __shared__ unsigned char smem[];
     float * s_row = (float *) smem;
-    float * s_tmp = s_row + nc;
-    float * s_reduce = s_tmp + nc;
+    float * s_tmp = s_row + QK_K;
+    float * s_reduce = s_tmp + QK_K;
     uint8_t * s_idx = (uint8_t *) (s_reduce + blockDim.x);
 
-    float norm_sq = 0.0f;
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        const float v = src0_row[i];
-        s_row[i] = v;
-        norm_sq += v * v;
-    }
-
-    s_reduce[tid] = norm_sq;
-    __syncthreads();
-
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_reduce[tid] += s_reduce[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        const float norm = sqrtf(s_reduce[0]);
-        s_reduce[0] = norm < 1e-10f ? 1e-10f : norm;
-    }
-    __syncthreads();
-
-    const float norm = s_reduce[0];
-    const float inv_norm = 1.0f / norm;
-    const float scale_up = sqrtf((float) nc);
-    const float scale_down = 1.0f / scale_up;
     const int64_t nb = nc / QK_K;
+    const float scale_up = sqrtf((float) TURBOQ_KV_DIM);
+    const float scale_down = 1.0f / scale_up;
 
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        s_row[i] *= inv_norm;
-    }
-    __syncthreads();
-
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        const float * q_row = Q + i*nc;
-        float sum = 0.0f;
-        for (int64_t j = 0; j < nc; ++j) {
-            sum += q_row[j] * s_row[j];
+    // Load all 256 elements and compute per-block norms
+    for (int64_t block_idx = 0; block_idx < nb; ++block_idx) {
+        const int64_t base = block_idx * QK_K;
+        float norm_sq = 0.0f;
+        for (int64_t i = tid; i < QK_K; i += blockDim.x) {
+            const float v = src0_row[base + i];
+            s_row[i] = v;
+            norm_sq += v * v;
         }
-        s_idx[i] = quantize_tbq2_scalar(sum * scale_up);
-        s_tmp[i] = tbq2_codebook_value(s_idx[i]) * scale_down;
-    }
-    __syncthreads();
+        s_reduce[tid] = norm_sq;
+        __syncthreads();
 
-    float gamma_sq = 0.0f;
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        float mse_sum = 0.0f;
-        for (int64_t j = 0; j < nc; ++j) {
-            mse_sum += Q[j*nc + i] * s_tmp[j];
+        for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                s_reduce[tid] += s_reduce[tid + stride];
+            }
+            __syncthreads();
         }
-        const float residual = s_row[i] - mse_sum;
-        s_row[i] = residual;
-        gamma_sq += residual * residual;
-    }
 
-    s_reduce[tid] = gamma_sq;
-    __syncthreads();
-
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_reduce[tid] += s_reduce[tid + stride];
+        if (tid == 0) {
+            const float norm = sqrtf(s_reduce[0]);
+            s_reduce[0] = norm < 1e-10f ? 1e-10f : norm;
         }
         __syncthreads();
-    }
 
-    if (tid == 0) {
-        s_reduce[0] = sqrtf(s_reduce[0]);
-    }
-    __syncthreads();
+        const float norm = s_reduce[0];
+        const float inv_norm = 1.0f / norm;
 
-    const float gamma = s_reduce[0];
-
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        const float * s_proj_row = S + i*nc;
-        float qjl_sum = 0.0f;
-        for (int64_t j = 0; j < nc; ++j) {
-            qjl_sum += s_proj_row[j] * s_row[j];
+        // Normalize
+        for (int64_t i = tid; i < QK_K; i += blockDim.x) {
+            s_row[i] *= inv_norm;
         }
-        s_tmp[i] = qjl_sum;
-    }
-    __syncthreads();
+        __syncthreads();
 
-    for (int64_t b = tid; b < nb; b += blockDim.x) {
-        if (b == 0) {
-            dst_row_ptr[b].d = __float2half(norm);
-            dst_row_ptr[b].gamma = __float2half(gamma);
-        } else {
-            dst_row_ptr[b].d = __float2half(0.0f);
-            dst_row_ptr[b].gamma = __float2half(0.0f);
+        // Blockwise 128x128 forward rotation: Q @ x for each half
+        for (int h = 0; h < 2; ++h) {
+            const int col = tid % TURBOQ_KV_DIM;
+            float sum = 0.0f;
+            const float * q_col = Q + col * TURBOQ_KV_DIM;
+            const float * x_half = s_row + h * TURBOQ_KV_DIM;
+            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
+                sum += q_col[j] * x_half[j];
+            }
+            const int out_idx = h * TURBOQ_KV_DIM + col;
+            s_idx[out_idx] = quantize_tbq2_scalar(sum * scale_up);
+            s_tmp[out_idx] = tbq2_codebook_value(s_idx[out_idx]) * scale_down;
         }
-    }
+        __syncthreads();
 
-    for (int64_t byte_idx = tid; byte_idx < nb * (QK_K / 4); byte_idx += blockDim.x) {
-        const int64_t block_idx = byte_idx / (QK_K / 4);
-        const int64_t byte_in_block = byte_idx % (QK_K / 4);
-        const int64_t base = block_idx * QK_K + byte_in_block * 4;
-        uint8_t packed = 0;
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            packed |= (s_idx[base + j] & 0x3u) << (j * 2);
+        // Blockwise 128x128 MSE residual: Q^T @ s_tmp - x
+        for (int h = 0; h < 2; ++h) {
+            const int col = tid % TURBOQ_KV_DIM;
+            float mse_sum = 0.0f;
+            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
+                mse_sum += Q[j*TURBOQ_KV_DIM + col] * s_tmp[h * TURBOQ_KV_DIM + j];
+            }
+            const int out_idx = h * TURBOQ_KV_DIM + col;
+            const float residual = s_row[out_idx] - mse_sum;
+            s_row[out_idx] = residual;
         }
-        dst_row_ptr[block_idx].qs[byte_in_block] = packed;
-    }
+        __syncthreads();
 
-    for (int64_t byte_idx = tid; byte_idx < nb * (QK_K / 8); byte_idx += blockDim.x) {
-        const int64_t block_idx = byte_idx / (QK_K / 8);
-        const int64_t byte_in_block = byte_idx % (QK_K / 8);
-        const int64_t base = block_idx * QK_K + byte_in_block * 8;
-        uint8_t packed = 0;
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            if (s_tmp[base + j] >= 0.0f) {
-                packed |= 1u << j;
+        // Compute gamma (residual norm) - all threads participate
+        {
+            float gamma_sq = 0.0f;
+            for (int64_t i = tid; i < QK_K; i += blockDim.x) {
+                gamma_sq += s_row[i] * s_row[i];
+            }
+            s_reduce[tid] = gamma_sq;
+            __syncthreads();
+            for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    s_reduce[tid] += s_reduce[tid + stride];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                s_reduce[0] = sqrtf(s_reduce[0]);
+            }
+            __syncthreads();
+        }
+
+        const float gamma = s_reduce[0];
+
+        // Blockwise 128x128 QJL projection: S @ residual
+        for (int h = 0; h < 2; ++h) {
+            const int col = tid % TURBOQ_KV_DIM;
+            float qjl_sum = 0.0f;
+            const float * s_col = S + col * TURBOQ_KV_DIM;
+            const float * res_half = s_row + h * TURBOQ_KV_DIM;
+            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
+                qjl_sum += s_col[j] * res_half[j];
+            }
+            const int out_idx = h * TURBOQ_KV_DIM + col;
+            s_tmp[out_idx] = qjl_sum;
+        }
+        __syncthreads();
+
+        // Store norm/gamma (block 0 only)
+        if (tid == 0) {
+            if (block_idx == 0) {
+                dst_row_ptr[block_idx].d = __float2half(norm);
+                dst_row_ptr[block_idx].gamma = __float2half(gamma);
+            } else {
+                dst_row_ptr[block_idx].d = __float2half(0.0f);
+                dst_row_ptr[block_idx].gamma = __float2half(0.0f);
             }
         }
-        dst_row_ptr[block_idx].signs[byte_in_block] = packed;
+        __syncthreads();
+
+        // Pack 2-bit indices (96 bytes for 256 elements)
+        constexpr int PACK_GROUPS = QK_K / 4;
+        for (int64_t group_idx = tid; group_idx < PACK_GROUPS; group_idx += blockDim.x) {
+            const int64_t byte_in_block = group_idx;
+            const int64_t base = group_idx * 4;
+            uint8_t packed = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                packed |= (s_idx[base + j] & 0x3u) << (j * 2);
+            }
+            dst_row_ptr[block_idx].qs[byte_in_block] = packed;
+        }
+        __syncthreads();
+
+        // Pack signs (32 bytes for 256 elements)
+        constexpr int SIGN_BYTES = QK_K / 8;
+        for (int64_t byte_idx = tid; byte_idx < SIGN_BYTES; byte_idx += blockDim.x) {
+            const int64_t base = byte_idx * 8;
+            uint8_t packed = 0;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                if (s_tmp[base + j] >= 0.0f) {
+                    packed |= 1u << j;
+                }
+            }
+            dst_row_ptr[block_idx].signs[byte_idx] = packed;
+        }
+        __syncthreads();
     }
 
     GGML_UNUSED(ne10);
@@ -596,134 +610,157 @@ static __global__ void k_set_rows_tbqp4(
 
     extern __shared__ unsigned char smem[];
     float * s_row = (float *) smem;
-    float * s_tmp = s_row + nc;
-    float * s_reduce = s_tmp + nc;
+    float * s_tmp = s_row + QK_K;
+    float * s_reduce = s_tmp + QK_K;
     uint8_t * s_idx = (uint8_t *) (s_reduce + blockDim.x);
 
-    float norm_sq = 0.0f;
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        const float v = src0_row[i];
-        s_row[i] = v;
-        norm_sq += v * v;
-    }
-
-    s_reduce[tid] = norm_sq;
-    __syncthreads();
-
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_reduce[tid] += s_reduce[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        const float norm = sqrtf(s_reduce[0]);
-        s_reduce[0] = norm < 1e-10f ? 1e-10f : norm;
-    }
-    __syncthreads();
-
-    const float norm = s_reduce[0];
-    const float inv_norm = 1.0f / norm;
-    const float scale_up = sqrtf((float) nc);
-    const float scale_down = 1.0f / scale_up;
     const int64_t nb = nc / QK_K;
+    const float scale_up = sqrtf((float) TURBOQ_KV_DIM);
+    const float scale_down = 1.0f / scale_up;
 
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        s_row[i] *= inv_norm;
-    }
-    __syncthreads();
-
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        const float * q_row = Q + i*nc;
-        float sum = 0.0f;
-        for (int64_t j = 0; j < nc; ++j) {
-            sum += q_row[j] * s_row[j];
+    // Load all 256 elements and compute per-block norms
+    for (int64_t block_idx = 0; block_idx < nb; ++block_idx) {
+        const int64_t base = block_idx * QK_K;
+        float norm_sq = 0.0f;
+        for (int64_t i = tid; i < QK_K; i += blockDim.x) {
+            const float v = src0_row[base + i];
+            s_row[i] = v;
+            norm_sq += v * v;
         }
-        s_idx[i] = quantize_tbq3_scalar(sum * scale_up);
-        s_tmp[i] = tbq3_codebook_value(s_idx[i]) * scale_down;
-    }
-    __syncthreads();
+        s_reduce[tid] = norm_sq;
+        __syncthreads();
 
-    float gamma_sq = 0.0f;
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        float mse_sum = 0.0f;
-        for (int64_t j = 0; j < nc; ++j) {
-            mse_sum += Q[j*nc + i] * s_tmp[j];
+        for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                s_reduce[tid] += s_reduce[tid + stride];
+            }
+            __syncthreads();
         }
-        const float residual = s_row[i] - mse_sum;
-        s_row[i] = residual;
-        gamma_sq += residual * residual;
-    }
 
-    s_reduce[tid] = gamma_sq;
-    __syncthreads();
-
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_reduce[tid] += s_reduce[tid + stride];
+        if (tid == 0) {
+            const float norm = sqrtf(s_reduce[0]);
+            s_reduce[0] = norm < 1e-10f ? 1e-10f : norm;
         }
         __syncthreads();
-    }
 
-    if (tid == 0) {
-        s_reduce[0] = sqrtf(s_reduce[0]);
-    }
-    __syncthreads();
+        const float norm = s_reduce[0];
+        const float inv_norm = 1.0f / norm;
 
-    const float gamma = s_reduce[0];
-
-    for (int64_t i = tid; i < nc; i += blockDim.x) {
-        const float * s_proj_row = S + i*nc;
-        float qjl_sum = 0.0f;
-        for (int64_t j = 0; j < nc; ++j) {
-            qjl_sum += s_proj_row[j] * s_row[j];
+        // Normalize
+        for (int64_t i = tid; i < QK_K; i += blockDim.x) {
+            s_row[i] *= inv_norm;
         }
-        s_tmp[i] = qjl_sum;
-    }
-    __syncthreads();
+        __syncthreads();
 
-    for (int64_t b = tid; b < nb; b += blockDim.x) {
-        if (b == 0) {
-            dst_row_ptr[b].d = __float2half(norm);
-            dst_row_ptr[b].gamma = __float2half(gamma);
-        } else {
-            dst_row_ptr[b].d = __float2half(0.0f);
-            dst_row_ptr[b].gamma = __float2half(0.0f);
+        // Blockwise 128x128 forward rotation: Q @ x for each half
+        for (int h = 0; h < 2; ++h) {
+            const int col = tid % TURBOQ_KV_DIM;
+            float sum = 0.0f;
+            const float * q_col = Q + col * TURBOQ_KV_DIM;
+            const float * x_half = s_row + h * TURBOQ_KV_DIM;
+            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
+                sum += q_col[j] * x_half[j];
+            }
+            const int out_idx = h * TURBOQ_KV_DIM + col;
+            s_idx[out_idx] = quantize_tbq3_scalar(sum * scale_up);
+            s_tmp[out_idx] = tbq3_codebook_value(s_idx[out_idx]) * scale_down;
         }
-    }
+        __syncthreads();
 
-    constexpr int TBQ3_GROUP = 8;
-    constexpr int TBQ3_GROUPS_PER_BLOCK = QK_K / TBQ3_GROUP;
-    for (int64_t group_idx = tid; group_idx < nb * TBQ3_GROUPS_PER_BLOCK; group_idx += blockDim.x) {
-        const int64_t block_idx = group_idx / TBQ3_GROUPS_PER_BLOCK;
-        const int64_t group_in_block = group_idx % TBQ3_GROUPS_PER_BLOCK;
-        const int64_t base = block_idx * QK_K + group_in_block * TBQ3_GROUP;
+        // Blockwise 128x128 MSE residual: Q^T @ s_tmp - x
+        for (int h = 0; h < 2; ++h) {
+            const int col = tid % TURBOQ_KV_DIM;
+            float mse_sum = 0.0f;
+            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
+                mse_sum += Q[j*TURBOQ_KV_DIM + col] * s_tmp[h * TURBOQ_KV_DIM + j];
+            }
+            const int out_idx = h * TURBOQ_KV_DIM + col;
+            const float residual = s_row[out_idx] - mse_sum;
+            s_row[out_idx] = residual;
+        }
+        __syncthreads();
 
-        uint32_t bits = 0;
-        #pragma unroll
-        for (int j = 0; j < TBQ3_GROUP; ++j) {
-            bits |= uint32_t(s_idx[base + j] & 0x7u) << (j * 3);
+        // Compute gamma (residual norm) - all threads participate
+        {
+            float gamma_sq = 0.0f;
+            for (int64_t i = tid; i < QK_K; i += blockDim.x) {
+                gamma_sq += s_row[i] * s_row[i];
+            }
+            s_reduce[tid] = gamma_sq;
+            __syncthreads();
+            for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    s_reduce[tid] += s_reduce[tid + stride];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                s_reduce[0] = sqrtf(s_reduce[0]);
+            }
+            __syncthreads();
         }
 
-        const int64_t byte_offset = group_in_block * 3;
-        dst_row_ptr[block_idx].qs[byte_offset + 0] = uint8_t(bits & 0xffu);
-        dst_row_ptr[block_idx].qs[byte_offset + 1] = uint8_t((bits >> 8) & 0xffu);
-        dst_row_ptr[block_idx].qs[byte_offset + 2] = uint8_t((bits >> 16) & 0xffu);
-    }
+        const float gamma = s_reduce[0];
 
-    for (int64_t byte_idx = tid; byte_idx < nb * (QK_K / 8); byte_idx += blockDim.x) {
-        const int64_t block_idx = byte_idx / (QK_K / 8);
-        const int64_t byte_in_block = byte_idx % (QK_K / 8);
-        const int64_t base = block_idx * QK_K + byte_in_block * 8;
-        uint8_t packed = 0;
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            if (s_tmp[base + j] >= 0.0f) {
-                packed |= 1u << j;
+        // Blockwise 128x128 QJL projection: S @ residual
+        for (int h = 0; h < 2; ++h) {
+            const int col = tid % TURBOQ_KV_DIM;
+            float qjl_sum = 0.0f;
+            const float * s_col = S + col * TURBOQ_KV_DIM;
+            const float * res_half = s_row + h * TURBOQ_KV_DIM;
+            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
+                qjl_sum += s_col[j] * res_half[j];
+            }
+            const int out_idx = h * TURBOQ_KV_DIM + col;
+            s_tmp[out_idx] = qjl_sum;
+        }
+        __syncthreads();
+
+        // Store norm/gamma (block 0 only)
+        if (tid == 0) {
+            if (block_idx == 0) {
+                dst_row_ptr[block_idx].d = __float2half(norm);
+                dst_row_ptr[block_idx].gamma = __float2half(gamma);
+            } else {
+                dst_row_ptr[block_idx].d = __float2half(0.0f);
+                dst_row_ptr[block_idx].gamma = __float2half(0.0f);
             }
         }
-        dst_row_ptr[block_idx].signs[byte_in_block] = packed;
+        __syncthreads();
+
+        // Pack 3-bit indices (96 bytes for 256 elements) - 8 groups of 8 elements = 24 bytes per block
+        constexpr int TBQ4_GROUP = 8;
+        constexpr int TBQ4_GROUPS_PER_BLOCK = QK_K / TBQ4_GROUP;
+        for (int64_t group_idx = tid; group_idx < TBQ4_GROUPS_PER_BLOCK; group_idx += blockDim.x) {
+            const int64_t base = group_idx * TBQ4_GROUP;
+
+            uint32_t bits = 0;
+            #pragma unroll
+            for (int j = 0; j < TBQ4_GROUP; ++j) {
+                bits |= uint32_t(s_idx[base + j] & 0x7u) << (j * 3);
+            }
+
+            const int64_t byte_offset = group_idx * 3;
+            dst_row_ptr[block_idx].qs[byte_offset + 0] = uint8_t(bits & 0xffu);
+            dst_row_ptr[block_idx].qs[byte_offset + 1] = uint8_t((bits >> 8) & 0xffu);
+            dst_row_ptr[block_idx].qs[byte_offset + 2] = uint8_t((bits >> 16) & 0xffu);
+        }
+        __syncthreads();
+
+        // Pack signs (32 bytes for 256 elements)
+        constexpr int SIGN_BYTES = QK_K / 8;
+        for (int64_t byte_idx = tid; byte_idx < SIGN_BYTES; byte_idx += blockDim.x) {
+            const int64_t base = byte_idx * 8;
+            uint8_t packed = 0;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                if (s_tmp[base + j] >= 0.0f) {
+                    packed |= 1u << j;
+                }
+            }
+            dst_row_ptr[block_idx].signs[byte_idx] = packed;
+        }
+        __syncthreads();
     }
 
     GGML_UNUSED(ne10);
@@ -757,9 +794,9 @@ static void set_rows_cuda_tbq3(
 
     if (ne_rows > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
         const uint64_t seed = turboq_seed_from_row(0);
-        const float * d_Q = tbq_get_rotation_device((int) ne00, seed, stream);
+        const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM, seed, stream);
 
-        const size_t shared_bytes = size_t(ne00) * sizeof(float) + size_t(CUDA_SET_ROWS_BLOCK_SIZE) * sizeof(float) + size_t(ne00) * sizeof(uint8_t);
+        const size_t shared_bytes = size_t(QK_K) * sizeof(float) + size_t(CUDA_SET_ROWS_BLOCK_SIZE) * sizeof(float) + size_t(QK_K) * sizeof(uint8_t);
         GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
         const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
@@ -799,9 +836,9 @@ static void set_rows_cuda_tbq4(
 
     if (ne_rows > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
         const uint64_t seed = turboq_seed_from_row(0);
-        const float * d_Q = tbq_get_rotation_device((int) ne00, seed, stream);
+        const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM, seed, stream);
 
-        const size_t shared_bytes = size_t(ne00) * sizeof(float) + size_t(CUDA_SET_ROWS_BLOCK_SIZE) * sizeof(float) + size_t(ne00) * sizeof(uint8_t);
+        const size_t shared_bytes = size_t(QK_K) * sizeof(float) + size_t(CUDA_SET_ROWS_BLOCK_SIZE) * sizeof(float) + size_t(QK_K) * sizeof(uint8_t);
         GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
         const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
@@ -841,13 +878,13 @@ static void set_rows_cuda_tbqp3(
 
     if (ne_rows > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
         const uint64_t seed = turboq_seed_from_row(0);
-        const float * d_Q = tbq_get_rotation_device((int) ne00, seed, stream);
-        const float * d_S = tbq_get_projection_device((int) ne00, seed, stream);
+        const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM, seed, stream);
+        const float * d_S = tbq_get_projection_device(TURBOQ_KV_DIM, seed, stream);
 
         const size_t shared_bytes =
-            2 * size_t(ne00) * sizeof(float) +
+            2 * size_t(QK_K) * sizeof(float) +
             size_t(CUDA_SET_ROWS_BLOCK_SIZE) * sizeof(float) +
-            size_t(ne00) * sizeof(uint8_t);
+            size_t(QK_K) * sizeof(uint8_t);
         GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
         const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
@@ -887,13 +924,13 @@ static void set_rows_cuda_tbqp4(
 
     if (ne_rows > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
         const uint64_t seed = turboq_seed_from_row(0);
-        const float * d_Q = tbq_get_rotation_device((int) ne00, seed, stream);
-        const float * d_S = tbq_get_projection_device((int) ne00, seed, stream);
+        const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM, seed, stream);
+        const float * d_S = tbq_get_projection_device(TURBOQ_KV_DIM, seed, stream);
 
         const size_t shared_bytes =
-            2 * size_t(ne00) * sizeof(float) +
+            2 * size_t(QK_K) * sizeof(float) +
             size_t(CUDA_SET_ROWS_BLOCK_SIZE) * sizeof(float) +
-            size_t(ne00) * sizeof(uint8_t);
+            size_t(QK_K) * sizeof(uint8_t);
         GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
         const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);

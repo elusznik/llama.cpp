@@ -11,6 +11,8 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+#define TURBOQ_KV_DIM 128
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
@@ -402,7 +404,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3(
     const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
     const float norm = __half2float((half) K_tbqp3[0].d);
     const float gamma = __half2float((half) K_tbqp3[0].gamma);
-    const float scale_down = 1.0f / sqrtf((float) D);
+    const float scale_down = 1.0f / sqrtf((float) QK_K);
     const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) D;
 
     float sum = 0.0f;
@@ -463,7 +465,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4(
     const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
     const float norm = __half2float((half) K_tbqp4[0].d);
     const float gamma = __half2float((half) K_tbqp4[0].gamma);
-    const float scale_down = 1.0f / sqrtf((float) D);
+    const float scale_down = 1.0f / sqrtf((float) QK_K);
     const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) D;
 
     float sum = 0.0f;
@@ -1139,7 +1141,7 @@ void launch_fattn(
     }
 
     if (!need_f16_K && (K_is_tbq || K_is_tbqp)) {
-        turboq_Q = ggml_cuda_turboq_get_rotation_device((int) K->ne[0], main_stream);
+        turboq_Q = ggml_cuda_turboq_get_rotation_device(K_is_tbq ? TURBOQ_KV_DIM : (int) K->ne[0], main_stream);
     }
 
     if (!need_f16_K && K_is_tbqp) {
