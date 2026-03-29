@@ -125,6 +125,27 @@ static __device__ __forceinline__ float tbq3_codebook_value_fattn(uint8_t idx) {
     }
 }
 
+static __device__ __forceinline__ float tbq4_codebook_value_fattn(uint8_t idx) {
+    switch (idx) {
+        case 0:  return -2.7326f;
+        case 1:  return -2.0690f;
+        case 2:  return -1.6185f;
+        case 3:  return -1.2562f;
+        case 4:  return -0.9423f;
+        case 5:  return -0.6568f;
+        case 6:  return -0.3880f;
+        case 7:  return -0.1284f;
+        case 8:  return  0.1284f;
+        case 9:  return  0.3880f;
+        case 10: return  0.6568f;
+        case 11: return  0.9423f;
+        case 12: return  1.2562f;
+        case 13: return  1.6185f;
+        case 14: return  2.0690f;
+        default: return  2.7326f;
+    }
+}
+
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
@@ -400,6 +421,37 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3(
 }
 
 template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tbq3_0 * K_tbq3 = (const block_tbq3_0 *) K_c;
+    const float * q_rot = (const float *) Q_v;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
+    const float norm = __half2float((half) K_tbq3[0].d);
+    const float scale_down = 1.0f / sqrtf((float) D);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i = lane; i < D; i += nthreads) {
+        const int block_idx = i / QK_K;
+        const int in_block = i % QK_K;
+        const int group = in_block / 8;
+        const int shift = (in_block % 8) * 3;
+        const uint8_t * qs = K_tbq3[block_idx].qs + group * 3;
+        const uint32_t bits = uint32_t(qs[0]) | (uint32_t(qs[1]) << 8) | (uint32_t(qs[2]) << 16);
+        const uint8_t idx = (bits >> shift) & 0x7u;
+
+        sum += q_rot[i] * tbq3_codebook_value_fattn(idx) * scale_down;
+    }
+
+    return norm * sum;
+}
+
+template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
@@ -428,6 +480,33 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4(
         const float sign = ((K_tbqp4[block_idx].signs[in_block / 8] >> (in_block % 8)) & 1u) ? 1.0f : -1.0f;
 
         sum += q_rot[i] * tbq3_codebook_value_fattn(idx) * scale_down + qjl_f * q_proj[i] * sign;
+    }
+
+    return norm * sum;
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tbq4_0 * K_tbq4 = (const block_tbq4_0 *) K_c;
+    const float * q_rot = (const float *) Q_v;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
+    const float norm = __half2float((half) K_tbq4[0].d);
+    const float scale_down = 1.0f / sqrtf((float) D);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i = lane; i < D; i += nthreads) {
+        const int block_idx = i / QK_K;
+        const int in_block = i % QK_K;
+        const uint8_t idx = (K_tbq4[block_idx].qs[in_block / 2] >> ((in_block % 2) * 4)) & 0xFu;
+
+        sum += q_rot[i] * tbq4_codebook_value_fattn(idx) * scale_down;
     }
 
     return norm * sum;
@@ -726,6 +805,10 @@ template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ3_0) {
+        return vec_dot_fattn_vec_KQ_tbq3<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ4_0) {
+        return vec_dot_fattn_vec_KQ_tbq4<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQP3_0) {
         return vec_dot_fattn_vec_KQ_tbqp3<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQP4_0) {
@@ -1023,6 +1106,7 @@ void launch_fattn(
     size_t nb21 = V->nb[1];
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
+    const bool K_is_tbq = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
     const bool K_is_tbqp = K->type == GGML_TYPE_TBQP3_0 || K->type == GGML_TYPE_TBQP4_0;
     const float * turboq_Q = nullptr;
     const float * turboq_S = nullptr;
@@ -1054,8 +1138,11 @@ void launch_fattn(
         K_data = (char *) K_f16.ptr;
     }
 
-    if (!need_f16_K && K_is_tbqp) {
+    if (!need_f16_K && (K_is_tbq || K_is_tbqp)) {
         turboq_Q = ggml_cuda_turboq_get_rotation_device((int) K->ne[0], main_stream);
+    }
+
+    if (!need_f16_K && K_is_tbqp) {
         turboq_S = ggml_cuda_turboq_get_projection_device((int) K->ne[0], main_stream);
     }
 

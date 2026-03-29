@@ -76,7 +76,9 @@ static __global__ void flash_attn_ext_vec(
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #endif // GGML_USE_HIP
 
+    constexpr bool Q_tbq = type_K == GGML_TYPE_TBQ3_0 || type_K == GGML_TYPE_TBQ4_0;
     constexpr bool Q_tbqp = type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0;
+    constexpr bool Q_turboq = Q_tbq || Q_tbqp;
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
     constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_KQ_q;
     constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_V_q;
@@ -88,7 +90,7 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
-    constexpr bool Q_q8_1 = !Q_tbqp && type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
+    constexpr bool Q_q8_1 = !Q_turboq && type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -122,7 +124,7 @@ static __global__ void flash_attn_ext_vec(
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
     __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
 #endif // V_DOT2_F32_F16_AVAILABLE
-    __shared__ float Q_tbqp_rot[Q_tbqp ? ncols*D : 1];
+    __shared__ float Q_tbq_rot[Q_turboq ? ncols*D : 1];
     __shared__ float Q_tbqp_proj[Q_tbqp ? ncols*D : 1];
 
     float KQ_max[ncols];
@@ -141,7 +143,7 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     int    Q_i32[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
     float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
-    if constexpr (Q_tbqp) {
+    if constexpr (Q_turboq) {
 #pragma unroll
         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
@@ -152,7 +154,7 @@ static __global__ void flash_attn_ext_vec(
 
             const bool in_bounds = ncols == 1 || ic0 + j < int(ne01.z);
             const float * Q_f = (const float *) (Q + j*nb01);
-            float * q_rot = Q_tbqp_rot + j*D;
+            float * q_rot = Q_tbq_rot + j*D;
             float * q_proj = Q_tbqp_proj + j*D;
 
             for (int i = threadIdx.x; i < D; i += WARP_SIZE) {
@@ -161,10 +163,14 @@ static __global__ void flash_attn_ext_vec(
                 for (int h = 0; h < D; ++h) {
                     const float qv = in_bounds ? Q_f[h] * scale : 0.0f;
                     rot += turboq_Q[i*D + h] * qv;
-                    proj += turboq_S[i*D + h] * qv;
+                    if constexpr (Q_tbqp) {
+                        proj += turboq_S[i*D + h] * qv;
+                    }
                 }
                 q_rot[i] = rot;
-                q_proj[i] = proj;
+                if constexpr (Q_tbqp) {
+                    q_proj[i] = proj;
+                }
             }
         }
 
@@ -293,8 +299,8 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum;
-                if constexpr (Q_tbqp) {
-                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_tbqp_rot + j*D, nullptr, Q_tbqp_proj + j*D);
+                if constexpr (Q_turboq) {
+                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_tbq_rot + j*D, nullptr, Q_tbqp ? (const void *) (Q_tbqp_proj + j*D) : nullptr);
                 } else {
                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
                 }

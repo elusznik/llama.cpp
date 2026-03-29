@@ -223,6 +223,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
 
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ3_0,  GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
 
@@ -335,9 +337,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+    const bool K_is_tbq = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
     const bool K_is_tbqp = K->type == GGML_TYPE_TBQP3_0 || K->type == GGML_TYPE_TBQP4_0;
 
-    if (K_is_tbqp) {
+    if (K_is_tbq || K_is_tbqp) {
         if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -531,6 +534,12 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
 
+template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_TBQ3_0,  GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_TBQ3_0,  GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TBQ3_0,  GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_TBQ4_0,  GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_TBQ4_0,  GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TBQ4_0,  GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_TBQP3_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_TBQP3_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TBQP3_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
