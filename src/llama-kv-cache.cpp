@@ -27,10 +27,12 @@ static ggml_type llama_kv_cache_mixed_type(
         ggml_type type_lo,
         ggml_type type_hi,
         uint32_t n_outlier_ch,
-        bool     is_value) {
-    GGML_UNUSED(type_hi);
-    GGML_UNUSED(n_outlier_ch);
-    GGML_UNUSED(is_value);
+        bool     /* is_value */) {
+    // Only use mixed precision types when outlier splitting is active
+    if (type_hi == GGML_TYPE_COUNT || n_outlier_ch == 0) {
+        // No outlier splitting - use base type
+        return type_lo;
+    }
 
     // Select TBQ34_0 or TBQP34_0 based on whether base type is TBQ or TBQP
     if (type_lo == GGML_TYPE_TBQ3_0 || type_lo == GGML_TYPE_TBQ4_0) {
