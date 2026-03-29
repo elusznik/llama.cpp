@@ -385,6 +385,110 @@ static void dequantize_row_tbq4_nc_cuda(
             (const block_tbq4_0 *) vx, y, ne00, ne01, ne0203, ne02_fd, s01, s02, s03, d_Q);
 }
 
+// TBQ34_0: mixed 3.5-bit - 64 regular channels (3-bit) + 64 outlier channels (4-bit) per 128-wide half
+template<typename dst_t>
+static __global__ void dequantize_row_tbq34_nc(
+        const block_tbq34_0 * __restrict__ vx,
+        dst_t * __restrict__ y,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne0203,
+        const uint3 ne02,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const float * __restrict__ Q) {
+    const int64_t row_id = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (row_id >= ne01 * ne0203) {
+        return;
+    }
+
+    const uint2 dm = fast_div_modulo((uint32_t) (row_id / ne01), ne02);
+    const int64_t i01 = row_id % ne01;
+    const int64_t i02 = dm.y;
+    const int64_t i03 = dm.x;
+
+    const block_tbq34_0 * row = vx + i03*s03 + i02*s02 + i01*s01;
+    dst_t * out = y + row_id * ne00;
+
+    extern __shared__ float smem[];
+    float * s_rot = smem;
+    const float scale_down = 1.0f / sqrtf((float) TURBOQ_KV_DIM);
+    const int64_t nb = ne00 / QK_K;
+
+    // Each 256-element block: 2 halves of 128 elements
+    // Half 0 (indices 0-63 regular, 64-127 outlier), Half 1 (indices 128-191 regular, 192-255 outlier)
+    for (int64_t block_idx = 0; block_idx < nb; ++block_idx) {
+        const int64_t base = block_idx * QK_K;
+        const int half = tid / TURBOQ_KV_DIM;  // 0 or 1
+        const int in_half = tid % TURBOQ_KV_DIM;  // 0-127
+
+        // Dequantize based on position in half:
+        // - indices 0-63 (regular): 3-bit from qs_lo
+        // - indices 64-127 (outlier): 4-bit from qs_hi
+        float val;
+        if (in_half < 64) {
+            // Regular channel: 3-bit from qs_lo
+            // qs_lo layout: half0 bytes 0-23, half1 bytes 24-47 (48 bytes total for 128 3-bit values)
+            // 3 bits per value, 8 values per 3 bytes
+            const int lo_half_off = half * 24;  // byte offset for this half
+            const int val_idx = in_half;  // 0-63
+            const int byte_idx = lo_half_off + (val_idx * 3) / 8;
+            const int bit_shift = (val_idx * 3) % 8;
+            const uint8_t bits = row[block_idx].qs_lo[byte_idx];
+            const uint8_t idx = (bits >> bit_shift) & 0x7u;
+            val = tbq3_codebook_value(idx) * scale_down;
+        } else {
+            // Outlier channel: 4-bit from qs_hi
+            // qs_hi layout: half0 bytes 0-31, half1 bytes 32-63 (64 bytes total for 128 4-bit values)
+            const int hi_half_off = half * 32;  // byte offset for this half
+            const int val_idx = in_half - 64;  // 0-63
+            const int byte_idx = hi_half_off + val_idx / 2;
+            const uint8_t bits = row[block_idx].qs_hi[byte_idx];
+            const uint8_t idx = (val_idx & 1) == 0 ? (bits & 0x0fu) : ((bits >> 4) & 0x0fu);
+            val = tbq4_codebook_value(idx) * scale_down;
+        }
+
+        // All 256 threads write their dequantized value
+        s_rot[tid] = val;
+        __syncthreads();
+
+        // Blockwise 128x128 inverse rotation: Q^T @ s_rot
+        // Thread i computes output position i using s_rot[half*128 : half*128+127]
+        const int col = tid % TURBOQ_KV_DIM;
+        float sum = 0.0f;
+        for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
+            sum += Q[j*TURBOQ_KV_DIM + col] * s_rot[half * TURBOQ_KV_DIM + j];
+        }
+
+        const float norm = __half2float(row[block_idx].d);
+        out[base + tid] = ggml_cuda_cast<dst_t>(sum * norm);
+        __syncthreads();
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_tbq34_nc_cuda(
+        const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+    const int64_t ne0203 = ne02 * ne03;
+    const int64_t nrows = ne01 * ne0203;
+    const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
+    const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM);
+    const size_t shared_bytes = size_t(QK_K) * sizeof(float);
+
+    GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
+    GGML_ASSERT(nrows < UINT_MAX);
+
+    dequantize_row_tbq34_nc<<<nrows, QK_K, shared_bytes, stream>>>(
+            (const block_tbq34_0 *) vx, y, ne00, ne01, ne0203, ne02_fd, s01, s02, s03, d_Q);
+}
+
 template<typename dst_t>
 static void dequantize_row_tbqp3_nc_cuda(
         const void * vx, dst_t * y,
@@ -425,6 +529,116 @@ static void dequantize_row_tbqp4_nc_cuda(
 
     dequantize_row_tbqp4_nc<<<nrows, QK_K, shared_bytes, stream>>>(
             (const block_tbqp4_0 *) vx, y, ne00, ne01, ne0203, ne02_fd, s01, s02, s03, d_Q, d_S);
+}
+
+// TBQP34_0: mixed Q_prod 3.625-bit - 64 regular channels (2-bit) + 64 outlier channels (3-bit) per 128-wide half
+// Plus 1-bit QJL signs for all 256 elements
+template<typename dst_t>
+static __global__ void dequantize_row_tbqp34_nc(
+        const block_tbqp34_0 * __restrict__ vx,
+        dst_t * __restrict__ y,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne0203,
+        const uint3 ne02,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const float * __restrict__ Q,
+        const float * __restrict__ S) {
+    const int64_t row_id = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (row_id >= ne01 * ne0203) {
+        return;
+    }
+
+    const uint2 dm = fast_div_modulo((uint32_t) (row_id / ne01), ne02);
+    const int64_t i01 = row_id % ne01;
+    const int64_t i02 = dm.y;
+    const int64_t i03 = dm.x;
+
+    const block_tbqp34_0 * row = vx + i03*s03 + i02*s02 + i01*s01;
+    dst_t * out = y + row_id * ne00;
+
+    extern __shared__ float smem[];
+    float * s_mse_rot = smem;
+    float * s_signs = s_mse_rot + QK_K;
+
+    const float scale_down = 1.0f / sqrtf((float) TURBOQ_KV_DIM);
+    const int64_t nb = ne00 / QK_K;
+
+    // Each 256-element block: 2 halves of 128 elements
+    // Half 0 (indices 0-63 regular 2-bit, 64-127 outlier 3-bit), Half 1 (128-191 regular, 192-255 outlier)
+    for (int64_t block_idx = 0; block_idx < nb; ++block_idx) {
+        const int64_t base = block_idx * QK_K;
+        const int half = tid / TURBOQ_KV_DIM;  // 0 or 1
+        const int in_half = tid % TURBOQ_KV_DIM;  // 0-127
+        const float norm = __half2float(row[block_idx].d);
+        const float gamma = __half2float(row[block_idx].gamma);
+        const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) TURBOQ_KV_DIM;
+
+        // Dequantize MSE values and load signs
+        float mse_val;
+        if (in_half < 64) {
+            // Regular channel: 2-bit from qs_lo
+            // qs_lo layout: half0 bytes 0-15, half1 bytes 16-31 (32 bytes total for 128 2-bit values)
+            // 2 bits per value, 4 values per byte
+            const int lo_half_off = half * 16;  // byte offset for this half
+            const int val_idx = in_half;  // 0-63
+            const int byte_idx = lo_half_off + val_idx / 4;
+            const int bit_shift = (val_idx % 4) * 2;
+            const uint8_t bits = row[block_idx].qs_lo[byte_idx];
+            const uint8_t idx = (bits >> bit_shift) & 0x3u;
+            mse_val = tbq2_codebook_value(idx) * scale_down;
+        } else {
+            // Outlier channel: 3-bit from qs_hi
+            // qs_hi layout: half0 bytes 0-23, half1 bytes 24-47 (48 bytes total for 128 3-bit values)
+            // 3 bits per value, 8 values per 3 bytes
+            const int hi_half_off = half * 24;  // byte offset for this half
+            const int val_idx = in_half - 64;  // 0-63
+            const int byte_idx = hi_half_off + (val_idx * 3) / 8;
+            const int bit_shift = (val_idx * 3) % 8;
+            const uint8_t bits = row[block_idx].qs_hi[byte_idx];
+            const uint8_t idx = (bits >> bit_shift) & 0x7u;
+            mse_val = tbq3_codebook_value(idx) * scale_down;
+        }
+        s_mse_rot[tid] = mse_val;
+        s_signs[tid] = ((row[block_idx].signs[in_half / 8] >> (in_half % 8)) & 1u) ? 1.0f : -1.0f;
+        __syncthreads();
+
+        // Blockwise 128x128 matvecs: Q^T @ mse_rot and S @ signs
+        const int col = tid % TURBOQ_KV_DIM;
+        float mse_sum = 0.0f;
+        float qjl_sum = 0.0f;
+        for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
+            mse_sum += Q[j*TURBOQ_KV_DIM + col] * s_mse_rot[half * TURBOQ_KV_DIM + j];
+            qjl_sum += S[j*TURBOQ_KV_DIM + col] * s_signs[half * TURBOQ_KV_DIM + j];
+        }
+        out[base + tid] = ggml_cuda_cast<dst_t>(norm * (mse_sum + qjl_f * qjl_sum));
+        __syncthreads();
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_tbqp34_nc_cuda(
+        const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+    const int64_t ne0203 = ne02 * ne03;
+    const int64_t nrows = ne01 * ne0203;
+    const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
+    const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM);
+    const float * d_S = tbq_get_projection_device(TURBOQ_KV_DIM);
+    const size_t shared_bytes = 2 * size_t(QK_K) * sizeof(float);
+
+    GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
+    GGML_ASSERT(nrows < UINT_MAX);
+
+    dequantize_row_tbqp34_nc<<<nrows, QK_K, shared_bytes, stream>>>(
+            (const block_tbqp34_0 *) vx, y, ne00, ne01, ne0203, ne02_fd, s01, s02, s03, d_Q, d_S);
 }
 
 } // namespace
@@ -1250,10 +1464,14 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_row_tbq3_nc_cuda;
         case GGML_TYPE_TBQ4_0:
             return dequantize_row_tbq4_nc_cuda;
+        case GGML_TYPE_TBQ34_0:
+            return dequantize_row_tbq34_nc_cuda;
         case GGML_TYPE_TBQP3_0:
             return dequantize_row_tbqp3_nc_cuda;
         case GGML_TYPE_TBQP4_0:
             return dequantize_row_tbqp4_nc_cuda;
+        case GGML_TYPE_TBQP34_0:
+            return dequantize_row_tbqp34_nc_cuda;
         case GGML_TYPE_Q4_0:
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case GGML_TYPE_Q4_1:
@@ -1300,10 +1518,14 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_row_tbq3_nc_cuda;
         case GGML_TYPE_TBQ4_0:
             return dequantize_row_tbq4_nc_cuda;
+        case GGML_TYPE_TBQ34_0:
+            return dequantize_row_tbq34_nc_cuda;
         case GGML_TYPE_TBQP3_0:
             return dequantize_row_tbqp3_nc_cuda;
         case GGML_TYPE_TBQP4_0:
             return dequantize_row_tbqp4_nc_cuda;
+        case GGML_TYPE_TBQP34_0:
+            return dequantize_row_tbqp34_nc_cuda;
         case GGML_TYPE_Q4_0:
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case GGML_TYPE_Q4_1:

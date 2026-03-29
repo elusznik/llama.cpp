@@ -9,7 +9,9 @@
 static inline bool ggml_cuda_fattn_uses_f16_staging(const ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ||
         type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0 ||
-        type == GGML_TYPE_TBQP3_0 || type == GGML_TYPE_TBQP4_0;
+        type == GGML_TYPE_TBQ34_0 ||
+        type == GGML_TYPE_TBQP3_0 || type == GGML_TYPE_TBQP4_0 ||
+        type == GGML_TYPE_TBQP34_0;
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -337,8 +339,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
-    const bool K_is_tbq = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
-    const bool K_is_tbqp = K->type == GGML_TYPE_TBQP3_0 || K->type == GGML_TYPE_TBQP4_0;
+    const bool K_is_tbq = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0 ||
+                          K->type == GGML_TYPE_TBQ34_0;
+    const bool K_is_tbqp = K->type == GGML_TYPE_TBQP3_0 || K->type == GGML_TYPE_TBQP4_0 ||
+                           K->type == GGML_TYPE_TBQP34_0;
 
     if (K_is_tbq || K_is_tbqp) {
         if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {

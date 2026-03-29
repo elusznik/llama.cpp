@@ -76,8 +76,10 @@ static __global__ void flash_attn_ext_vec(
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #endif // GGML_USE_HIP
 
-    constexpr bool Q_tbq = type_K == GGML_TYPE_TBQ3_0 || type_K == GGML_TYPE_TBQ4_0;
-    constexpr bool Q_tbqp = type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0;
+    constexpr bool Q_tbq = type_K == GGML_TYPE_TBQ3_0 || type_K == GGML_TYPE_TBQ4_0 ||
+                          type_K == GGML_TYPE_TBQ34_0;
+    constexpr bool Q_tbqp = type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0 ||
+                          type_K == GGML_TYPE_TBQP34_0;
     constexpr bool Q_turboq = Q_tbq || Q_tbqp;
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
     constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_KQ_q;

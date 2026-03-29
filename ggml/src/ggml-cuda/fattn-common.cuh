@@ -1108,8 +1108,10 @@ void launch_fattn(
     size_t nb21 = V->nb[1];
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
-    const bool K_is_tbq = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
-    const bool K_is_tbqp = K->type == GGML_TYPE_TBQP3_0 || K->type == GGML_TYPE_TBQP4_0;
+    const bool K_is_tbq = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0 ||
+                          K->type == GGML_TYPE_TBQ34_0;
+    const bool K_is_tbqp = K->type == GGML_TYPE_TBQP3_0 || K->type == GGML_TYPE_TBQP4_0 ||
+                           K->type == GGML_TYPE_TBQP34_0;
     const float * turboq_Q = nullptr;
     const float * turboq_S = nullptr;
 
