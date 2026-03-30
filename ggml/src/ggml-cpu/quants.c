@@ -509,10 +509,26 @@ void ggml_vec_dot_tbq3_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
     int64_t idx = 0;
     for (int i = 0; i < nb; i++) {
         const float d = y[i].d;
-        for (int j = 0; j < QK_K; j++) {
-            sumf += tmp[idx] * (d * y[i].qs[j]);
-            idx++;
+        int j = 0;
+#if defined(__ARM_NEON)
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        for (; j + 7 < QK_K; j += 8) {
+            const float32x4_t tv0 = vld1q_f32(tmp + idx + j);
+            const float32x4_t tv1 = vld1q_f32(tmp + idx + j + 4);
+            const int8x8_t qi = vld1_s8(y[i].qs + j);
+            const int16x8_t qi16 = vmovl_s8(qi);
+            const float32x4_t qf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qi16)));
+            const float32x4_t qf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(qi16)));
+            acc0 = vfmaq_f32(acc0, tv0, qf0);
+            acc1 = vfmaq_f32(acc1, tv1, qf1);
         }
+        sumf += d * vaddvq_f32(vaddq_f32(acc0, acc1));
+#endif
+        for (; j < QK_K; j++) {
+            sumf += tmp[idx + j] * (d * y[i].qs[j]);
+        }
+        idx += QK_K;
     }
 
     *s = sumf;
@@ -535,10 +551,26 @@ void ggml_vec_dot_tbq4_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
     int64_t idx = 0;
     for (int i = 0; i < nb; i++) {
         const float d = y[i].d;
-        for (int j = 0; j < QK_K; j++) {
-            sumf += tmp[idx] * (d * y[i].qs[j]);
-            idx++;
+        int j = 0;
+#if defined(__ARM_NEON)
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        for (; j + 7 < QK_K; j += 8) {
+            const float32x4_t tv0 = vld1q_f32(tmp + idx + j);
+            const float32x4_t tv1 = vld1q_f32(tmp + idx + j + 4);
+            const int8x8_t qi = vld1_s8(y[i].qs + j);
+            const int16x8_t qi16 = vmovl_s8(qi);
+            const float32x4_t qf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qi16)));
+            const float32x4_t qf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(qi16)));
+            acc0 = vfmaq_f32(acc0, tv0, qf0);
+            acc1 = vfmaq_f32(acc1, tv1, qf1);
         }
+        sumf += d * vaddvq_f32(vaddq_f32(acc0, acc1));
+#endif
+        for (; j < QK_K; j++) {
+            sumf += tmp[idx + j] * (d * y[i].qs[j]);
+        }
+        idx += QK_K;
     }
 
     *s = sumf;

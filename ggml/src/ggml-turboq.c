@@ -290,6 +290,17 @@ static void matvec_row(float * y, const float * M, const float * x, int64_t d) {
 #endif
         }
         sum += turboq_hsum_avx(acc);
+#elif defined(__ARM_NEON)
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        for (; j + 7 < d; j += 8) {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(row + j),     vld1q_f32(x + j));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(row + j + 4), vld1q_f32(x + j + 4));
+        }
+        for (; j + 3 < d; j += 4) {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(row + j), vld1q_f32(x + j));
+        }
+        sum += vaddvq_f32(vaddq_f32(acc0, acc1));
 #endif
         for (; j < d; ++j) {
             sum += row[j] * x[j];
@@ -319,6 +330,17 @@ static void matvec_t(float * y, const float * M, const float * x, int64_t d) {
 #endif
         }
         sum += turboq_hsum_avx(acc);
+#elif defined(__ARM_NEON)
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        for (; i + 7 < d; i += 8) {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(col + i),     vld1q_f32(x + i));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(col + i + 4), vld1q_f32(x + i + 4));
+        }
+        for (; i + 3 < d; i += 4) {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(col + i), vld1q_f32(x + i));
+        }
+        sum += vaddvq_f32(vaddq_f32(acc0, acc1));
 #endif
         for (; i < d; ++i) {
             sum += col[i] * x[i]; // M^T[j,i] = M[i,j] = M[i + j*d]
