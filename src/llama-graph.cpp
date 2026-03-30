@@ -1970,11 +1970,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         k->type == GGML_TYPE_TBQP3_0 || k->type == GGML_TYPE_TBQP4_0 || k->type == GGML_TYPE_TBQP34_0;
     const bool v_is_tbq = v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0 || v->type == GGML_TYPE_TBQ34_0 ||
         v->type == GGML_TYPE_TBQP3_0 || v->type == GGML_TYPE_TBQP4_0 || v->type == GGML_TYPE_TBQP34_0;
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // Disable flash attention for TBQ34/TBQP34 standalone - concat in restore path only supports F32
+    const bool k_is_tbq34_standalone = (k->type == GGML_TYPE_TBQ34_0 || k->type == GGML_TYPE_TBQP34_0) && !k_is_split;
+    const bool v_is_tbq34_standalone = (v->type == GGML_TYPE_TBQ34_0 || v->type == GGML_TYPE_TBQP34_0) && !v_is_split;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !k_is_tbq34_standalone && !v_is_tbq34_standalone;
     const enum ggml_type tbq_attn_type = use_flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // TBQP34_0/TBQ34_0 standalone don't need special flash attention handling
     const bool k_tbqp_cpu_flash = use_flash_attn &&
         !k_is_split &&
-        (k->type == GGML_TYPE_TBQP3_0 || k->type == GGML_TYPE_TBQP4_0 || k->type == GGML_TYPE_TBQP34_0) &&
+        (k->type == GGML_TYPE_TBQP3_0 || k->type == GGML_TYPE_TBQP4_0) &&
         k->buffer != nullptr && ggml_backend_buffer_is_host(k->buffer);
     const bool k_tbqp_split_cpu_flash = use_flash_attn &&
         k_is_split &&
@@ -1994,7 +1998,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
-    if (k_is_split) {
+    // TBQ34/TBQP34 standalone types are already packed, skip rebuild path
+    if (k_is_split && k->type != GGML_TYPE_TBQ34_0 && k->type != GGML_TYPE_TBQP34_0) {
         const int64_t n_head_kv = hparams.n_head_kv(il);
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
         const int64_t n_outlier = cparams.n_outlier_k_ch;
@@ -2028,7 +2033,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     } else if (k_is_tbq) {
         const int64_t n_head_kv = hparams.n_head_kv(il);
         const int64_t n_embd_k_gqa = k->ne[0];
-        const enum ggml_type k_src_type = k->type;
 
         GGML_ASSERT(n_head_kv > 0);
         GGML_ASSERT(n_embd_k_gqa % n_head_kv == 0);
@@ -2036,15 +2040,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         k = ggml_cast(ctx0, k, tbq_attn_type);
         cb(k, use_flash_attn ? "k_tbq_f16" : "k_tbq_f32", il);
 
-        if (k_src_type == GGML_TYPE_TBQ34_0 || k_src_type == GGML_TYPE_TBQP34_0) {
-            k = llm_graph_restore_packed_tbq(ctx0, k, k_perm, n_embd_k_gqa / n_head_kv, n_head_kv);
-        } else {
-            k = ggml_reshape_4d(ctx0, k, n_embd_k_gqa / n_head_kv, n_head_kv, k->ne[1], k->ne[2]);
-        }
+        // TBQ34/TBQP34 standalone: skip llm_graph_restore_packed_tbq (concat doesn't support F16 on CUDA)
+        // but still do the reshape needed for attention
+        k = ggml_reshape_4d(ctx0, k, n_embd_k_gqa / n_head_kv, n_head_kv, k->ne[1], k->ne[2]);
         cb(k, "k_tbq_reshaped", il);
     }
 
-    if (v_is_split) {
+    // TBQ34/TBQP34 standalone types are already packed, skip rebuild path
+    if (v_is_split && v->type != GGML_TYPE_TBQ34_0 && v->type != GGML_TYPE_TBQP34_0) {
         const int64_t n_head_kv = hparams.n_head_kv(il);
         const int64_t n_embd_head = hparams.n_embd_head_v(il);
         const int64_t n_outlier = cparams.n_outlier_v_ch;
@@ -2067,7 +2070,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     } else if (v_is_tbq) {
         const int64_t n_head_kv = hparams.n_head_kv(il);
         const int64_t n_embd_v_gqa = v->ne[0];
-        const enum ggml_type v_src_type = v->type;
 
         GGML_ASSERT(n_head_kv > 0);
         GGML_ASSERT(n_embd_v_gqa % n_head_kv == 0);
@@ -2079,11 +2081,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, tbq_attn_type);
             cb(v, use_flash_attn ? "v_tbq_f16" : "v_tbq_f32", il);
 
-            if (v_src_type == GGML_TYPE_TBQ34_0 || v_src_type == GGML_TYPE_TBQP34_0) {
-                v = llm_graph_restore_packed_tbq(ctx0, v, v_perm, n_embd_v_gqa / n_head_kv, n_head_kv);
-            } else {
-                v = ggml_reshape_4d(ctx0, v, n_embd_v_gqa / n_head_kv, n_head_kv, v->ne[1], v->ne[2]);
-            }
+            // TBQ34/TBQP34 standalone: skip llm_graph_restore_packed_tbq but still reshape
+            v = ggml_reshape_4d(ctx0, v, n_embd_v_gqa / n_head_kv, n_head_kv, v->ne[1], v->ne[2]);
             cb(v, "v_tbq_reshaped", il);
         }
     }

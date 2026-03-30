@@ -168,7 +168,7 @@ __global__ void k_tbq3_quant_kernel(
         s_rot[tid] = sum;
     } else if (tid < 2 * D) {
         float sum = 0.0f;
-        const int half_idx = tid - D;
+        const int half_idx = 0;  // Same Q rows (0-127) for second half of unit vector
         #pragma unroll
         for (int j = 0; j < D; j++) {
             sum += Q[half_idx * D + j] * s_unit[D + j];
@@ -272,7 +272,7 @@ __global__ void k_tbq4_quant_kernel(
         s_rot[tid] = sum;
     } else if (tid < 2 * D) {
         float sum = 0.0f;
-        const int half_idx = tid - D;
+        const int half_idx = 0;  // Same Q rows (0-127) for second half of unit vector
         #pragma unroll
         for (int j = 0; j < D; j++) {
             sum += Q[half_idx * D + j] * s_unit[D + j];

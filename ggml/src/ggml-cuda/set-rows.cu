@@ -100,8 +100,8 @@ static __device__ __forceinline__ uint8_t quantize_tbq4_scalar(float x) {
 static __device__ __forceinline__ float tbq2_codebook_value(uint8_t idx) {
     switch (idx) {
         case 0: return -1.5104f;
-        case 1: return -0.4529f;
-        case 2: return  0.4529f;
+        case 1: return -0.4528f;
+        case 2: return  0.4528f;
         default: return  1.5104f;
     }
 }
@@ -558,7 +558,7 @@ static __global__ void k_set_rows_tbqp3(
     uint8_t * s_idx = (uint8_t *) (s_reduce + blockDim.x);
 
     const int64_t nb = nc / QK_K;
-    const float scale_up = sqrtf((float) TURBOQ_KV_DIM);
+    const float scale_up = sqrtf((float) QK_K);
     const float scale_down = 1.0f / scale_up;
 
     // Load all 256 elements and compute per-block norms
@@ -765,7 +765,7 @@ static __global__ void k_set_rows_tbqp4(
     uint8_t * s_idx = (uint8_t *) (s_reduce + blockDim.x);
 
     const int64_t nb = nc / QK_K;
-    const float scale_up = sqrtf((float) TURBOQ_KV_DIM);
+    const float scale_up = sqrtf((float) QK_K);
     const float scale_down = 1.0f / scale_up;
 
     // Load all 256 elements and compute per-block norms
@@ -980,7 +980,7 @@ static __global__ void k_set_rows_tbqp34(
     uint8_t * s_idx_hi = s_idx_lo + QK_K;
 
     const int64_t nb = nc / QK_K;
-    const float scale_up = sqrtf((float) TURBOQ_KV_DIM);
+    const float scale_up = sqrtf((float) QK_K);
     const float scale_down = 1.0f / scale_up;
 
     for (int64_t block_idx = 0; block_idx < nb; ++block_idx) {

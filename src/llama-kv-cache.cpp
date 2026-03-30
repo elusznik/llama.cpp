@@ -28,6 +28,11 @@ static ggml_type llama_kv_cache_mixed_type(
         ggml_type type_hi,
         uint32_t n_outlier_ch,
         bool     /* is_value */) {
+    // Return TBQ34/TBQP34 as-is - they don't need further conversion
+    if (type_lo == GGML_TYPE_TBQ34_0 || type_lo == GGML_TYPE_TBQP34_0) {
+        return type_lo;
+    }
+
     // Only use mixed precision types when outlier splitting is active
     if (type_hi == GGML_TYPE_COUNT || n_outlier_ch == 0) {
         // No outlier splitting - use base type
@@ -584,8 +589,13 @@ llama_kv_cache::llama_kv_cache(
         const ggml_type mixed_v_type = has_v && !v_trans ? llama_kv_cache_mixed_type(type_v, type_v_outlier, n_outlier_v_ch, true) : GGML_TYPE_COUNT;
         const bool use_k_mixed = mixed_k_type != GGML_TYPE_COUNT;
         const bool use_v_mixed = mixed_v_type != GGML_TYPE_COUNT;
-        const bool use_k_outlier = !use_k_mixed && has_k && llama_kv_cache_use_outlier_split(type_k, type_k_outlier, n_outlier_k_ch, n_head_kv, n_embd_head_k);
-        const bool use_v_outlier = !use_v_mixed && has_v && !v_trans && llama_kv_cache_use_outlier_split(type_v, type_v_outlier, n_outlier_v_ch, n_head_kv, n_embd_head_v);
+
+        // Check if TBQ34/TBQP34 is used as standalone type (not via outlier splitting)
+        const bool k_is_tbq34_standalone = (mixed_k_type == GGML_TYPE_TBQ34_0 || mixed_k_type == GGML_TYPE_TBQP34_0) && n_outlier_k_ch == 0;
+        const bool v_is_tbq34_standalone = (mixed_v_type == GGML_TYPE_TBQ34_0 || mixed_v_type == GGML_TYPE_TBQP34_0) && n_outlier_v_ch == 0;
+
+        const bool use_k_outlier = (!use_k_mixed || k_is_tbq34_standalone) ? false : has_k && llama_kv_cache_use_outlier_split(type_k, type_k_outlier, n_outlier_k_ch, n_head_kv, n_embd_head_k);
+        const bool use_v_outlier = (!use_v_mixed || v_is_tbq34_standalone) ? false : has_v && !v_trans && llama_kv_cache_use_outlier_split(type_v, type_v_outlier, n_outlier_v_ch, n_head_kv, n_embd_head_v);
 
         const ggml_type k_type_alloc = use_k_mixed ? mixed_k_type : type_k;
         const ggml_type v_type_alloc = use_v_mixed ? mixed_v_type : type_v;
@@ -1761,7 +1771,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 
     // take this branch when FA is enabled (the V cache is not transposed)
     if (!v_trans) {
-        if (v->type == GGML_TYPE_TBQ34_0) {
+        if (v->type == GGML_TYPE_TBQ34_0 || v->type == GGML_TYPE_TBQP34_0) {
             const auto & perm = layers[ikv].v_perm;
             ggml_tensor * v_cur_packed = perm.local.empty()
                 ? ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0)

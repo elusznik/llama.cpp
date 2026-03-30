@@ -67,8 +67,8 @@ static const float * tbq_get_projection_device(int d) {
 static __device__ __forceinline__ float tbq2_codebook_value(uint8_t idx) {
     switch (idx) {
         case 0: return -1.5104f;
-        case 1: return -0.4529f;
-        case 2: return  0.4529f;
+        case 1: return -0.4528f;
+        case 2: return  0.4528f;
         default: return  1.5104f;
     }
 }
@@ -249,20 +249,20 @@ static __global__ void dequantize_row_tbqp3_nc(
     float * s_mse_rot = smem;
     float * s_signs = s_mse_rot + QK_K;
 
-    const float scale_down = 1.0f / sqrtf((float) TURBOQ_KV_DIM);
+    const float scale_down = 1.0f / sqrtf((float) QK_K);
     const int64_t nb = ne00 / QK_K;
 
     for (int64_t block_idx = 0; block_idx < nb; ++block_idx) {
         const int64_t base = block_idx * QK_K;
         const float norm = __half2float(row[block_idx].d);
         const float gamma = __half2float(row[block_idx].gamma);
-        const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) TURBOQ_KV_DIM;
+        const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) QK_K;
 
         // Load MSE codebook values and signs for this block
         const int64_t in_block = tid;
         const uint8_t idx = (row[block_idx].qs[in_block / 4] >> ((in_block % 4) * 2)) & 0x3u;
         s_mse_rot[tid] = tbq2_codebook_value(idx) * scale_down;
-        s_signs[tid] = ((row[block_idx].signs[in_block / 8] >> (in_block % 8)) & 1u) ? 1.0f : -1.0f;
+        s_signs[tid] = ((row[block_idx].signs[tid / 8] >> (tid % 8)) & 1u) ? 1.0f : -1.0f;
         __syncthreads();
 
         // Blockwise 128x128 matvecs: Q^T @ mse_rot and S @ signs
@@ -311,14 +311,14 @@ static __global__ void dequantize_row_tbqp4_nc(
     float * s_mse_rot = smem;
     float * s_signs = s_mse_rot + QK_K;
 
-    const float scale_down = 1.0f / sqrtf((float) TURBOQ_KV_DIM);
+    const float scale_down = 1.0f / sqrtf((float) QK_K);
     const int64_t nb = ne00 / QK_K;
 
     for (int64_t block_idx = 0; block_idx < nb; ++block_idx) {
         const int64_t base = block_idx * QK_K;
         const float norm = __half2float(row[block_idx].d);
         const float gamma = __half2float(row[block_idx].gamma);
-        const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) TURBOQ_KV_DIM;
+        const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) QK_K;
 
         // Load MSE codebook values and signs for this block
         const int64_t in_block = tid;
@@ -328,7 +328,7 @@ static __global__ void dequantize_row_tbqp4_nc(
         const uint32_t bits = uint32_t(qs[0]) | (uint32_t(qs[1]) << 8) | (uint32_t(qs[2]) << 16);
         const uint8_t idx = (bits >> shift) & 0x7u;
         s_mse_rot[tid] = tbq3_codebook_value(idx) * scale_down;
-        s_signs[tid] = ((row[block_idx].signs[in_block / 8] >> (in_block % 8)) & 1u) ? 1.0f : -1.0f;
+        s_signs[tid] = ((row[block_idx].signs[tid / 8] >> (tid % 8)) & 1u) ? 1.0f : -1.0f;
         __syncthreads();
 
         // Blockwise 128x128 matvecs: Q^T @ mse_rot and S @ signs
@@ -415,7 +415,7 @@ static __global__ void dequantize_row_tbq34_nc(
 
     extern __shared__ float smem[];
     float * s_rot = smem;
-    const float scale_down = 1.0f / sqrtf((float) TURBOQ_KV_DIM);
+    const float scale_down = 1.0f / sqrtf((float) QK_K);
     const int64_t nb = ne00 / QK_K;
 
     // Each 256-element block: 2 halves of 128 elements
@@ -565,7 +565,7 @@ static __global__ void dequantize_row_tbqp34_nc(
     float * s_mse_rot = smem;
     float * s_signs = s_mse_rot + QK_K;
 
-    const float scale_down = 1.0f / sqrtf((float) TURBOQ_KV_DIM);
+    const float scale_down = 1.0f / sqrtf((float) QK_K);
     const int64_t nb = ne00 / QK_K;
 
     // Each 256-element block: 2 halves of 128 elements
@@ -576,7 +576,7 @@ static __global__ void dequantize_row_tbqp34_nc(
         const int in_half = tid % TURBOQ_KV_DIM;  // 0-127
         const float norm = __half2float(row[block_idx].d);
         const float gamma = __half2float(row[block_idx].gamma);
-        const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) TURBOQ_KV_DIM;
+        const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) QK_K;
 
         // Dequantize MSE values and load signs
         float mse_val;
@@ -604,7 +604,7 @@ static __global__ void dequantize_row_tbqp34_nc(
             mse_val = tbq3_codebook_value(idx) * scale_down;
         }
         s_mse_rot[tid] = mse_val;
-        s_signs[tid] = ((row[block_idx].signs[in_half / 8] >> (in_half % 8)) & 1u) ? 1.0f : -1.0f;
+        s_signs[tid] = ((row[block_idx].signs[tid / 8] >> (tid % 8)) & 1u) ? 1.0f : -1.0f;
         __syncthreads();
 
         // Blockwise 128x128 matvecs: Q^T @ mse_rot and S @ signs

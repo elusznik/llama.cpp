@@ -108,8 +108,8 @@ typedef float (*vec_dot_KQ_t)(
 static __device__ __forceinline__ float tbq2_codebook_value_fattn(uint8_t idx) {
     switch (idx) {
         case 0: return -1.5104f;
-        case 1: return -0.4529f;
-        case 2: return  0.4529f;
+        case 1: return -0.4528f;
+        case 2: return  0.4528f;
         default: return  1.5104f;
     }
 }
@@ -405,7 +405,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3(
     const float norm = __half2float((half) K_tbqp3[0].d);
     const float gamma = __half2float((half) K_tbqp3[0].gamma);
     const float scale_down = 1.0f / sqrtf((float) QK_K);
-    const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) D;
+    const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) QK_K;
 
     float sum = 0.0f;
 
@@ -466,7 +466,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4(
     const float norm = __half2float((half) K_tbqp4[0].d);
     const float gamma = __half2float((half) K_tbqp4[0].gamma);
     const float scale_down = 1.0f / sqrtf((float) QK_K);
-    const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) D;
+    const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) QK_K;
 
     float sum = 0.0f;
 
@@ -509,6 +509,116 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4(
         const uint8_t idx = (K_tbq4[block_idx].qs[in_block / 2] >> ((in_block % 2) * 4)) & 0xFu;
 
         sum += q_rot[i] * tbq4_codebook_value_fattn(idx) * scale_down;
+    }
+
+    return norm * sum;
+}
+
+// TBQ34_0: mixed 3-bit (regular) + 4-bit (outlier) per 128-wide block
+// First 64 channels: 3-bit from qs_lo, Next 64 channels: 4-bit from qs_hi
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq34(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tbq34_0 * K_tbq34 = (const block_tbq34_0 *) K_c;
+    const float * q_rot = (const float *) Q_v;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
+    const float norm = __half2float((half) K_tbq34[0].d);
+    const float scale_down = 1.0f / sqrtf((float) D);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i = lane; i < D; i += nthreads) {
+        const int half = i / 64;  // 0 or 1 for two 64-channel halves
+        const int in_half = i % 64;  // 0-63 within the half
+
+        float val;
+        if (in_half < 32) {
+            // Regular channel: 3-bit from qs_lo
+            // qs_lo layout: half0 bytes 0-23, half1 bytes 24-47 (48 bytes for 128 3-bit values)
+            // 3 bits per value, 8 values per 3 bytes
+            const int lo_half_off = half * 24;
+            const int val_idx = in_half;  // 0-31 but we need 0-63
+            const int byte_idx = lo_half_off + (val_idx * 3) / 8;
+            const int bit_shift = (val_idx * 3) % 8;
+            const uint8_t bits = K_tbq34[half].qs_lo[byte_idx];
+            const uint8_t idx = (bits >> bit_shift) & 0x7u;
+            val = tbq3_codebook_value_fattn(idx) * scale_down;
+        } else {
+            // Outlier channel: 4-bit from qs_hi
+            // qs_hi layout: half0 bytes 0-31, half1 bytes 32-63 (64 bytes for 128 4-bit values)
+            const int hi_half_off = half * 32;
+            const int val_idx = in_half - 32;  // Map to 0-31 range
+            const int byte_idx = hi_half_off + val_idx / 2;
+            const int bit_shift = (val_idx % 2) * 4;
+            const uint8_t bits = K_tbq34[half].qs_hi[byte_idx];
+            const uint8_t idx = (bits >> bit_shift) & 0xFu;
+            val = tbq4_codebook_value_fattn(idx) * scale_down;
+        }
+
+        sum += q_rot[i] * val;
+    }
+
+    return norm * sum;
+}
+
+// TBQP34_0: mixed 2-bit (regular+signs) + 3-bit (outlier) per 128-wide block
+// First 64 channels: 2-bit from qs_lo + sign, Next 64 channels: 3-bit from qs_hi
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp34(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tbqp34_0 * K_tbqp34 = (const block_tbqp34_0 *) K_c;
+    const float * q_rot = (const float *) Q_v;
+    const float * q_proj = (const float *) Q_ds_v;
+    GGML_UNUSED(Q_q8);
+
+    const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
+    const float norm = __half2float((half) K_tbqp34[0].d);
+    const float gamma = __half2float((half) K_tbqp34[0].gamma);
+    const float scale_down = 1.0f / sqrtf((float) QK_K);
+    const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) QK_K;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i = lane; i < D; i += nthreads) {
+        const int half = i / 64;  // 0 or 1 for two 64-channel halves
+        const int in_half = i % 64;  // 0-63 within the half
+
+        float val;
+        float sign = 1.0f;
+        if (in_half < 32) {
+            // Regular channel: 2-bit from qs_lo + sign
+            // qs_lo layout: half0 bytes 0-15, half1 bytes 16-31 (32 bytes for 128 2-bit values)
+            // 2 bits per value, 4 values per byte
+            const int lo_half_off = half * 16;
+            const int val_idx = in_half;  // 0-31 but we need 0-63
+            const int byte_idx = lo_half_off + val_idx / 4;
+            const int bit_shift = (val_idx % 4) * 2;
+            const uint8_t bits = K_tbqp34[half].qs_lo[byte_idx];
+            const uint8_t idx = (bits >> bit_shift) & 0x3u;
+            val = tbq2_codebook_value_fattn(idx) * scale_down;
+            // signs layout: 32 bytes for 256 bits, indexed linearly by i
+            const int sign_idx = in_half + half * 64;
+            sign = ((K_tbqp34[half].signs[sign_idx / 8] >> (sign_idx % 8)) & 1u) ? 1.0f : -1.0f;
+        } else {
+            // Outlier channel: 3-bit from qs_hi (no sign)
+            // qs_hi layout: half0 bytes 0-23, half1 bytes 24-47 (48 bytes for 128 3-bit values)
+            const int hi_half_off = half * 24;
+            const int val_idx = in_half - 32;  // Map to 0-31 range
+            const int byte_idx = hi_half_off + (val_idx * 3) / 8;
+            const int bit_shift = (val_idx * 3) % 8;
+            const uint8_t bits = K_tbqp34[half].qs_hi[byte_idx];
+            const uint8_t idx = (bits >> bit_shift) & 0x7u;
+            val = tbq3_codebook_value_fattn(idx) * scale_down;
+        }
+
+        sum += q_rot[i] * val + qjl_f * q_proj[i] * sign;
     }
 
     return norm * sum;
@@ -815,6 +925,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_tbqp3<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQP4_0) {
         return vec_dot_fattn_vec_KQ_tbqp4<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ34_0) {
+        return vec_dot_fattn_vec_KQ_tbq34<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQP34_0) {
+        return vec_dot_fattn_vec_KQ_tbqp34<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
