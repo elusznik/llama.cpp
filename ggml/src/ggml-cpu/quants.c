@@ -108,6 +108,18 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq2_0_ref(x, y, k);
 }
 
+void quantize_row_tbq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    block_tbq3_0 * GGML_RESTRICT y = vy;
+    quantize_row_tbq3_0_ref(x, y, k);
+}
+
+void quantize_row_tbq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    block_tbq4_0 * GGML_RESTRICT y = vy;
+    quantize_row_tbq4_0_ref(x, y, k);
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
@@ -455,6 +467,115 @@ void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 
     *s = sumf;
 }
+
+// TurboQuant vec_dot falls back to dequantize-then-dot on CPU.
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__)
+#define TURBOQ_VD_TL _Thread_local
+#elif defined(__GNUC__) || defined(__clang__)
+#define TURBOQ_VD_TL __thread
+#elif defined(_MSC_VER)
+#define TURBOQ_VD_TL __declspec(thread)
+#else
+#define TURBOQ_VD_TL
+#endif
+
+static TURBOQ_VD_TL float * tbq_vd_buf = NULL;
+static TURBOQ_VD_TL int64_t tbq_vd_buf_size = 0;
+
+static float * tbq_vd_get_scratch(int64_t n) {
+    if (n > tbq_vd_buf_size) {
+        free(tbq_vd_buf);
+        tbq_vd_buf = (float *)malloc(n * sizeof(float));
+        tbq_vd_buf_size = n;
+    }
+    return tbq_vd_buf;
+}
+
+void ggml_vec_dot_tbq3_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    float * tmp = tbq_vd_get_scratch(n);
+    dequantize_row_tbq3_0((const block_tbq3_0 *)vx, tmp, n);
+
+    const block_q8_K * GGML_RESTRICT y = vy;
+    const int nb = n / QK_K;
+
+    float sumf = 0.0f;
+    int64_t idx = 0;
+    for (int i = 0; i < nb; i++) {
+        const float d = y[i].d;
+        int j = 0;
+#if defined(__ARM_NEON)
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        for (; j + 7 < QK_K; j += 8) {
+            const float32x4_t tv0 = vld1q_f32(tmp + idx + j);
+            const float32x4_t tv1 = vld1q_f32(tmp + idx + j + 4);
+            const int8x8_t qi = vld1_s8(y[i].qs + j);
+            const int16x8_t qi16 = vmovl_s8(qi);
+            const float32x4_t qf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qi16)));
+            const float32x4_t qf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(qi16)));
+            acc0 = vfmaq_f32(acc0, tv0, qf0);
+            acc1 = vfmaq_f32(acc1, tv1, qf1);
+        }
+        sumf += d * vaddvq_f32(vaddq_f32(acc0, acc1));
+#endif
+        for (; j < QK_K; j++) {
+            sumf += tmp[idx + j] * (d * y[i].qs[j]);
+        }
+        idx += QK_K;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tbq4_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    float * tmp = tbq_vd_get_scratch(n);
+    dequantize_row_tbq4_0((const block_tbq4_0 *)vx, tmp, n);
+
+    const block_q8_K * GGML_RESTRICT y = vy;
+    const int nb = n / QK_K;
+
+    float sumf = 0.0f;
+    int64_t idx = 0;
+    for (int i = 0; i < nb; i++) {
+        const float d = y[i].d;
+        int j = 0;
+#if defined(__ARM_NEON)
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        for (; j + 7 < QK_K; j += 8) {
+            const float32x4_t tv0 = vld1q_f32(tmp + idx + j);
+            const float32x4_t tv1 = vld1q_f32(tmp + idx + j + 4);
+            const int8x8_t qi = vld1_s8(y[i].qs + j);
+            const int16x8_t qi16 = vmovl_s8(qi);
+            const float32x4_t qf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qi16)));
+            const float32x4_t qf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(qi16)));
+            acc0 = vfmaq_f32(acc0, tv0, qf0);
+            acc1 = vfmaq_f32(acc1, tv1, qf1);
+        }
+        sumf += d * vaddvq_f32(vaddq_f32(acc0, acc1));
+#endif
+        for (; j < QK_K; j++) {
+            sumf += tmp[idx + j] * (d * y[i].qs[j]);
+        }
+        idx += QK_K;
+    }
+
+    *s = sumf;
+}
+
 
 void ggml_vec_dot_q2_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
