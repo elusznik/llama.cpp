@@ -162,7 +162,7 @@ static __global__ void flash_attn_ext_vec(
             for (int i = threadIdx.x; i < D; i += WARP_SIZE) {
                 float rot = 0.0f;
                 float proj = 0.0f;
-                if constexpr (Q_tbq) {
+                if constexpr (Q_tbq && !Q_tbqp) {
                     const int half = i / TURBOQ_KV_DIM;
                     const int col = i % TURBOQ_KV_DIM;
                     const float * q_half = Q_f + half * TURBOQ_KV_DIM;
@@ -312,7 +312,7 @@ static __global__ void flash_attn_ext_vec(
             for (int j = 0; j < ncols; ++j) {
                 float sum;
                 if constexpr (Q_turboq) {
-                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_tbq_rot + j*D, nullptr, Q_tbqp ? (const void *) (Q_tbqp_proj + j*D) : nullptr);
+                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_tbq_rot + j*D, &head, Q_tbqp ? (const void *) (Q_tbqp_proj + j*D) : nullptr);
                 } else {
                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
                 }

@@ -545,6 +545,7 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const bool is_mla = hparams.is_mla();
+    constexpr uint32_t turboq_mixed_outlier_ch = 64;
 
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -585,29 +586,63 @@ llama_kv_cache::llama_kv_cache(
         const uint32_t n_embd_head_k = hparams.n_embd_head_k(il);
         const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
 
-        const ggml_type mixed_k_type = has_k ? llama_kv_cache_mixed_type(type_k, type_k_outlier, n_outlier_k_ch, false) : GGML_TYPE_COUNT;
-        const ggml_type mixed_v_type = has_v && !v_trans ? llama_kv_cache_mixed_type(type_v, type_v_outlier, n_outlier_v_ch, true) : GGML_TYPE_COUNT;
+        ggml_type type_k_eff = type_k;
+        ggml_type type_v_eff = type_v;
+        ggml_type type_k_outlier_eff = type_k_outlier;
+        ggml_type type_v_outlier_eff = type_v_outlier;
+        uint32_t n_outlier_k_ch_eff = n_outlier_k_ch;
+        uint32_t n_outlier_v_ch_eff = n_outlier_v_ch;
+
+        const bool k_use_standalone_mixed_alias =
+                type_k_outlier == GGML_TYPE_COUNT &&
+                n_outlier_k_ch == 0 &&
+                (type_k == GGML_TYPE_TBQ34_0 || type_k == GGML_TYPE_TBQP34_0);
+        const bool v_use_standalone_mixed_alias =
+                type_v_outlier == GGML_TYPE_COUNT &&
+                n_outlier_v_ch == 0 &&
+                (type_v == GGML_TYPE_TBQ34_0 || type_v == GGML_TYPE_TBQP34_0);
+
+        if (k_use_standalone_mixed_alias) {
+            type_k_eff = type_k == GGML_TYPE_TBQ34_0 ? GGML_TYPE_TBQ3_0 : GGML_TYPE_TBQP3_0;
+            type_k_outlier_eff = type_k == GGML_TYPE_TBQ34_0 ? GGML_TYPE_TBQ4_0 : GGML_TYPE_TBQP4_0;
+            n_outlier_k_ch_eff = turboq_mixed_outlier_ch;
+        }
+
+        if (v_use_standalone_mixed_alias) {
+            type_v_eff = type_v == GGML_TYPE_TBQ34_0 ? GGML_TYPE_TBQ3_0 : GGML_TYPE_TBQP3_0;
+            type_v_outlier_eff = type_v == GGML_TYPE_TBQ34_0 ? GGML_TYPE_TBQ4_0 : GGML_TYPE_TBQP4_0;
+            n_outlier_v_ch_eff = turboq_mixed_outlier_ch;
+        }
+
+        const ggml_type mixed_k_type =
+                has_k && !k_use_standalone_mixed_alias ? llama_kv_cache_mixed_type(type_k_eff, type_k_outlier_eff, n_outlier_k_ch_eff, false) : GGML_TYPE_COUNT;
+        const ggml_type mixed_v_type =
+                has_v && !v_trans && !v_use_standalone_mixed_alias ? llama_kv_cache_mixed_type(type_v_eff, type_v_outlier_eff, n_outlier_v_ch_eff, true) : GGML_TYPE_COUNT;
         const bool use_k_mixed = mixed_k_type != GGML_TYPE_COUNT;
         const bool use_v_mixed = mixed_v_type != GGML_TYPE_COUNT;
 
         // Check if TBQ34/TBQP34 is used as standalone type (not via outlier splitting)
-        const bool k_is_tbq34_standalone = (mixed_k_type == GGML_TYPE_TBQ34_0 || mixed_k_type == GGML_TYPE_TBQP34_0) && n_outlier_k_ch == 0;
-        const bool v_is_tbq34_standalone = (mixed_v_type == GGML_TYPE_TBQ34_0 || mixed_v_type == GGML_TYPE_TBQP34_0) && n_outlier_v_ch == 0;
+        const bool k_is_tbq34_standalone = (mixed_k_type == GGML_TYPE_TBQ34_0 || mixed_k_type == GGML_TYPE_TBQP34_0) && n_outlier_k_ch_eff == 0;
+        const bool v_is_tbq34_standalone = (mixed_v_type == GGML_TYPE_TBQ34_0 || mixed_v_type == GGML_TYPE_TBQP34_0) && n_outlier_v_ch_eff == 0;
 
-        const bool use_k_outlier = (!use_k_mixed || k_is_tbq34_standalone) ? false : has_k && llama_kv_cache_use_outlier_split(type_k, type_k_outlier, n_outlier_k_ch, n_head_kv, n_embd_head_k);
-        const bool use_v_outlier = (!use_v_mixed || v_is_tbq34_standalone) ? false : has_v && !v_trans && llama_kv_cache_use_outlier_split(type_v, type_v_outlier, n_outlier_v_ch, n_head_kv, n_embd_head_v);
+        const bool use_k_outlier = k_use_standalone_mixed_alias ? true
+                : ((!use_k_mixed || k_is_tbq34_standalone) ? false
+                : has_k && llama_kv_cache_use_outlier_split(type_k_eff, type_k_outlier_eff, n_outlier_k_ch_eff, n_head_kv, n_embd_head_k));
+        const bool use_v_outlier = v_use_standalone_mixed_alias ? true
+                : ((!use_v_mixed || v_is_tbq34_standalone) ? false
+                : has_v && !v_trans && llama_kv_cache_use_outlier_split(type_v_eff, type_v_outlier_eff, n_outlier_v_ch_eff, n_head_kv, n_embd_head_v));
 
-        const ggml_type k_type_alloc = use_k_mixed ? mixed_k_type : type_k;
-        const ggml_type v_type_alloc = use_v_mixed ? mixed_v_type : type_v;
-        const uint32_t n_embd_k_reg = use_k_outlier ? llama_kv_cache_split_dim_padded(n_head_kv, n_embd_head_k, n_outlier_k_ch, false) : n_embd_k_gqa;
-        const uint32_t n_embd_k_out = use_k_outlier ? llama_kv_cache_split_dim_padded(n_head_kv, n_embd_head_k, n_outlier_k_ch, true) : 0;
-        const uint32_t n_embd_v_reg = use_v_outlier ? llama_kv_cache_split_dim_padded(n_head_kv, n_embd_head_v, n_outlier_v_ch, false) : n_embd_v_gqa;
-        const uint32_t n_embd_v_out = use_v_outlier ? llama_kv_cache_split_dim_padded(n_head_kv, n_embd_head_v, n_outlier_v_ch, true) : 0;
+        const ggml_type k_type_alloc = use_k_mixed ? mixed_k_type : type_k_eff;
+        const ggml_type v_type_alloc = use_v_mixed ? mixed_v_type : type_v_eff;
+        const uint32_t n_embd_k_reg = use_k_outlier ? llama_kv_cache_split_dim_padded(n_head_kv, n_embd_head_k, n_outlier_k_ch_eff, false) : n_embd_k_gqa;
+        const uint32_t n_embd_k_out = use_k_outlier ? llama_kv_cache_split_dim_padded(n_head_kv, n_embd_head_k, n_outlier_k_ch_eff, true) : 0;
+        const uint32_t n_embd_v_reg = use_v_outlier ? llama_kv_cache_split_dim_padded(n_head_kv, n_embd_head_v, n_outlier_v_ch_eff, false) : n_embd_v_gqa;
+        const uint32_t n_embd_v_out = use_v_outlier ? llama_kv_cache_split_dim_padded(n_head_kv, n_embd_head_v, n_outlier_v_ch_eff, true) : 0;
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, k_type_alloc, n_embd_k_reg, kv_size, n_stream) : nullptr;
-        ggml_tensor * k_out = use_k_outlier ? ggml_new_tensor_3d(ctx, type_k_outlier, n_embd_k_out, kv_size, n_stream) : nullptr;
+        ggml_tensor * k_out = use_k_outlier ? ggml_new_tensor_3d(ctx, type_k_outlier_eff, n_embd_k_out, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, v_type_alloc, n_embd_v_reg, kv_size, n_stream) : nullptr;
-        ggml_tensor * v_out = use_v_outlier ? ggml_new_tensor_3d(ctx, type_v_outlier, n_embd_v_out, kv_size, n_stream) : nullptr;
+        ggml_tensor * v_out = use_v_outlier ? ggml_new_tensor_3d(ctx, type_v_outlier_eff, n_embd_v_out, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         use_k_outlier && ggml_format_name(k_out, "cache_k_out_l%d", il);
@@ -630,7 +665,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, k_out, v, v_out, k_stream, k_out_stream, v_stream, v_out_stream, n_outlier_k_ch, n_outlier_v_ch, std::move(k_perm), std::move(v_perm) });
+        layers.push_back({ il, k, k_out, v, v_out, k_stream, k_out_stream, v_stream, v_out_stream, n_outlier_k_ch_eff, n_outlier_v_ch_eff, std::move(k_perm), std::move(v_perm) });
     }
 
     if (reuse) {
@@ -706,19 +741,42 @@ void llama_kv_cache::clear(bool data) {
 }
 
 void llama_kv_cache::maybe_init_split_perms() {
+    constexpr uint32_t turboq_mixed_outlier_ch = 64;
+
     for (auto & layer : layers) {
         const ggml_tensor * wk = model.layers[layer.il].wk;
+        const ggml_tensor * wv = model.layers[layer.il].wv;
+
+        const uint32_t k_outlier_ch = layer.n_outlier_k_ch > 0
+            ? layer.n_outlier_k_ch
+            : ((layer.k->type == GGML_TYPE_TBQ34_0 || layer.k->type == GGML_TYPE_TBQP34_0) ? turboq_mixed_outlier_ch : 0);
+        const uint32_t v_outlier_ch = layer.n_outlier_v_ch > 0
+            ? layer.n_outlier_v_ch
+            : ((layer.v && (layer.v->type == GGML_TYPE_TBQ34_0 || layer.v->type == GGML_TYPE_TBQP34_0)) ? turboq_mixed_outlier_ch : 0);
 
         if ((layer.k_out || layer.k->type == GGML_TYPE_TBQ34_0 || layer.k->type == GGML_TYPE_TBQP34_0) &&
-                wk != nullptr && layer.k_perm.local.empty() && layer.n_outlier_k_ch > 0) {
+                wk != nullptr && layer.k_perm.local.empty() && k_outlier_ch > 0) {
             layer.k_perm = llama_kv_cache_build_split_perm(
                     wk,
                     hparams.n_head_kv(layer.il),
                     hparams.n_embd_head_k(layer.il),
-                    layer.n_outlier_k_ch);
+                    k_outlier_ch);
             if (debug && !layer.k_perm.local.empty()) {
                 LLAMA_LOG_INFO("%s: layer %d initialized K split perm (%zu entries)\n",
                         __func__, layer.il, layer.k_perm.local.size());
+            }
+        }
+
+        if ((layer.v_out || (layer.v && (layer.v->type == GGML_TYPE_TBQ34_0 || layer.v->type == GGML_TYPE_TBQP34_0))) &&
+                wv != nullptr && layer.v_perm.local.empty() && v_outlier_ch > 0) {
+            layer.v_perm = llama_kv_cache_build_split_perm(
+                    wv,
+                    hparams.n_head_kv(layer.il),
+                    hparams.n_embd_head_v(layer.il),
+                    v_outlier_ch);
+            if (debug && !layer.v_perm.local.empty()) {
+                LLAMA_LOG_INFO("%s: layer %d initialized V split perm (%zu entries)\n",
+                        __func__, layer.il, layer.v_perm.local.size());
             }
         }
     }

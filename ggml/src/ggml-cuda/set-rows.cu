@@ -432,6 +432,8 @@ static __global__ void k_set_rows_tbq34(
         __syncthreads();
 
         const float inv_norm = 1.0f / s_reduce[0];
+        s_row[tid] *= inv_norm;
+        __syncthreads();
 
         // Compute rotation and store in s_rot
         const int half = tid / TURBOQ_KV_DIM;
@@ -446,50 +448,42 @@ static __global__ void k_set_rows_tbq34(
         s_rot[tid] = sum * scale_up;
         __syncthreads();
 
-        // Quantize: 4-bit for all values first (for outlier channels)
+        // Quantize all values to 4-bit first so the outlier section can reuse it.
         s_q4[tid] = quantize_tbq4_scalar(s_rot[tid]);
         __syncthreads();
 
-        // Pack 4-bit values for outlier channels (64-127 in each half) into qs_hi
-        // Each thread packs 2 values: thread t handles values (2t) and (2t+1) in its half
-        if (tid < QK_K / 2) {
-            const int val_idx = 2 * tid + half * TURBOQ_KV_DIM + TURBOQ_KV_DIM; // outlier offset
-            const uint8_t lo = s_q4[val_idx - 1] & 0x0fu;  // value at outlier index - 1
-            const uint8_t hi = s_q4[val_idx] & 0x0fu;      // value at outlier index
-            dst_row_ptr[b].qs_hi[tid + half * (QK_K/2)] = lo | (hi << 4);
+        // Pack 4-bit outliers: 32 bytes per 128-wide half.
+        if (col < 32) {
+            const int outlier_base = half * TURBOQ_KV_DIM + 64;
+            const int pair = col;
+            const int byte_idx = half * 32 + pair;
+            const uint8_t lo = s_q4[outlier_base + pair * 2 + 0] & 0x0fu;
+            const uint8_t hi = s_q4[outlier_base + pair * 2 + 1] & 0x0fu;
+            dst_row_ptr[b].qs_hi[byte_idx] = lo | (hi << 4);
         }
         __syncthreads();
 
-        // Now quantize and pack 3-bit values for regular channels (0-63 in each half)
-        // Each thread recomputes its 3-bit quantization
+        // Re-quantize regular channels to 3-bit.
         if (col < 64) {
             s_q4[tid] = quantize_tbq3_scalar(s_rot[tid]);  // reuse s_q4 for 3-bit indices
         }
         __syncthreads();
 
-        // Pack 3-bit values for regular channels into qs_lo
-        // Layout: half0 bytes 0-23, half1 bytes 24-47 (48 bytes total for 128 values)
-        // 8 values per 3 bytes
-        if (col < 64) {
-            const int lo_half_off = half * 24;  // byte offset for this half
-            const int val_idx = col;  // 0-63
-            const int group_idx = val_idx / 8;  // which group (0-7)
-            const int byte_base = lo_half_off + group_idx * 3;  // starting byte for this group
+        // Pack 3-bit regular channels: 8 groups of 8 values per 128-wide half.
+        if (col < 8) {
+            const int group_idx = col;
+            const int byte_base = half * 24 + group_idx * 3;
+            const int group_base = half * TURBOQ_KV_DIM + group_idx * 8;
 
-            // Compute 3-bit packed value for all 8 values in this group
             uint32_t packed = 0;
             #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                const int vi = group_idx * 8 + i;  // value index within half (0-63)
-                packed |= uint32_t(s_q4[half * TURBOQ_KV_DIM + vi] & 0x7u) << (i * 3);
+                packed |= uint32_t(s_q4[group_base + i] & 0x7u) << (i * 3);
             }
 
-            // Write 3 bytes - only threads with col < 8 write (one per group)
-            if (col < 8) {
-                dst_row_ptr[b].qs_lo[byte_base + 0] = uint8_t(packed & 0xffu);
-                dst_row_ptr[b].qs_lo[byte_base + 1] = uint8_t((packed >> 8) & 0xffu);
-                dst_row_ptr[b].qs_lo[byte_base + 2] = uint8_t((packed >> 16) & 0xffu);
-            }
+            dst_row_ptr[b].qs_lo[byte_base + 0] = uint8_t(packed & 0xffu);
+            dst_row_ptr[b].qs_lo[byte_base + 1] = uint8_t((packed >> 8) & 0xffu);
+            dst_row_ptr[b].qs_lo[byte_base + 2] = uint8_t((packed >> 16) & 0xffu);
         }
         __syncthreads();
 
@@ -595,31 +589,25 @@ static __global__ void k_set_rows_tbqp3(
         }
         __syncthreads();
 
-        // Blockwise 128x128 forward rotation: Q @ x for each half
-        for (int h = 0; h < 2; ++h) {
-            const int col = tid % TURBOQ_KV_DIM;
+        // Full QK_K x QK_K forward rotation: Q @ x
+        {
             float sum = 0.0f;
-            const float * q_col = Q + col * TURBOQ_KV_DIM;
-            const float * x_half = s_row + h * TURBOQ_KV_DIM;
-            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
-                sum += q_col[j] * x_half[j];
+            for (int j = 0; j < QK_K; ++j) {
+                sum += Q[j*QK_K + tid] * s_row[j];
             }
-            const int out_idx = h * TURBOQ_KV_DIM + col;
-            s_idx[out_idx] = quantize_tbq2_scalar(sum * scale_up);
-            s_tmp[out_idx] = tbq2_codebook_value(s_idx[out_idx]) * scale_down;
+            s_idx[tid] = quantize_tbq2_scalar(sum * scale_up);
+            s_tmp[tid] = tbq2_codebook_value(s_idx[tid]) * scale_down;
         }
         __syncthreads();
 
-        // Blockwise 128x128 MSE residual: Q^T @ s_tmp - x
-        for (int h = 0; h < 2; ++h) {
-            const int col = tid % TURBOQ_KV_DIM;
+        // Full QK_K x QK_K MSE residual: Q^T @ s_tmp - x
+        {
             float mse_sum = 0.0f;
-            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
-                mse_sum += Q[j*TURBOQ_KV_DIM + col] * s_tmp[h * TURBOQ_KV_DIM + j];
+            for (int j = 0; j < QK_K; ++j) {
+                mse_sum += Q[j*QK_K + tid] * s_tmp[j];
             }
-            const int out_idx = h * TURBOQ_KV_DIM + col;
-            const float residual = s_row[out_idx] - mse_sum;
-            s_row[out_idx] = residual;
+            const float residual = s_row[tid] - mse_sum;
+            s_row[tid] = residual;
         }
         __syncthreads();
 
@@ -645,17 +633,13 @@ static __global__ void k_set_rows_tbqp3(
 
         const float gamma = s_reduce[0];
 
-        // Blockwise 128x128 QJL projection: S @ residual
-        for (int h = 0; h < 2; ++h) {
-            const int col = tid % TURBOQ_KV_DIM;
+        // Full QK_K x QK_K QJL projection: S @ residual
+        {
             float qjl_sum = 0.0f;
-            const float * s_col = S + col * TURBOQ_KV_DIM;
-            const float * res_half = s_row + h * TURBOQ_KV_DIM;
-            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
-                qjl_sum += s_col[j] * res_half[j];
+            for (int j = 0; j < QK_K; ++j) {
+                qjl_sum += S[j*QK_K + tid] * s_row[j];
             }
-            const int out_idx = h * TURBOQ_KV_DIM + col;
-            s_tmp[out_idx] = qjl_sum;
+            s_tmp[tid] = qjl_sum;
         }
         __syncthreads();
 
@@ -802,31 +786,25 @@ static __global__ void k_set_rows_tbqp4(
         }
         __syncthreads();
 
-        // Blockwise 128x128 forward rotation: Q @ x for each half
-        for (int h = 0; h < 2; ++h) {
-            const int col = tid % TURBOQ_KV_DIM;
+        // Full QK_K x QK_K forward rotation: Q @ x
+        {
             float sum = 0.0f;
-            const float * q_col = Q + col * TURBOQ_KV_DIM;
-            const float * x_half = s_row + h * TURBOQ_KV_DIM;
-            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
-                sum += q_col[j] * x_half[j];
+            for (int j = 0; j < QK_K; ++j) {
+                sum += Q[j*QK_K + tid] * s_row[j];
             }
-            const int out_idx = h * TURBOQ_KV_DIM + col;
-            s_idx[out_idx] = quantize_tbq3_scalar(sum * scale_up);
-            s_tmp[out_idx] = tbq3_codebook_value(s_idx[out_idx]) * scale_down;
+            s_idx[tid] = quantize_tbq3_scalar(sum * scale_up);
+            s_tmp[tid] = tbq3_codebook_value(s_idx[tid]) * scale_down;
         }
         __syncthreads();
 
-        // Blockwise 128x128 MSE residual: Q^T @ s_tmp - x
-        for (int h = 0; h < 2; ++h) {
-            const int col = tid % TURBOQ_KV_DIM;
+        // Full QK_K x QK_K MSE residual: Q^T @ s_tmp - x
+        {
             float mse_sum = 0.0f;
-            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
-                mse_sum += Q[j*TURBOQ_KV_DIM + col] * s_tmp[h * TURBOQ_KV_DIM + j];
+            for (int j = 0; j < QK_K; ++j) {
+                mse_sum += Q[j*QK_K + tid] * s_tmp[j];
             }
-            const int out_idx = h * TURBOQ_KV_DIM + col;
-            const float residual = s_row[out_idx] - mse_sum;
-            s_row[out_idx] = residual;
+            const float residual = s_row[tid] - mse_sum;
+            s_row[tid] = residual;
         }
         __syncthreads();
 
@@ -852,17 +830,13 @@ static __global__ void k_set_rows_tbqp4(
 
         const float gamma = s_reduce[0];
 
-        // Blockwise 128x128 QJL projection: S @ residual
-        for (int h = 0; h < 2; ++h) {
-            const int col = tid % TURBOQ_KV_DIM;
+        // Full QK_K x QK_K QJL projection: S @ residual
+        {
             float qjl_sum = 0.0f;
-            const float * s_col = S + col * TURBOQ_KV_DIM;
-            const float * res_half = s_row + h * TURBOQ_KV_DIM;
-            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
-                qjl_sum += s_col[j] * res_half[j];
+            for (int j = 0; j < QK_K; ++j) {
+                qjl_sum += S[j*QK_K + tid] * s_row[j];
             }
-            const int out_idx = h * TURBOQ_KV_DIM + col;
-            s_tmp[out_idx] = qjl_sum;
+            s_tmp[tid] = qjl_sum;
         }
         __syncthreads();
 
@@ -1075,17 +1049,13 @@ static __global__ void k_set_rows_tbqp34(
 
         const float gamma = s_reduce[0];
 
-        // Blockwise 128x128 QJL projection: S @ residual
-        for (int h = 0; h < 2; ++h) {
-            const int col = tid % TURBOQ_KV_DIM;
+        // Full QK_K x QK_K QJL projection: S @ residual
+        {
             float qjl_sum = 0.0f;
-            const float * s_col = S + col * TURBOQ_KV_DIM;
-            const float * res_half = s_row + h * TURBOQ_KV_DIM;
-            for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
-                qjl_sum += s_col[j] * res_half[j];
+            for (int j = 0; j < QK_K; ++j) {
+                qjl_sum += S[j*QK_K + tid] * s_row[j];
             }
-            const int out_idx = h * TURBOQ_KV_DIM + col;
-            s_tmp[out_idx] = qjl_sum;
+            s_tmp[tid] = qjl_sum;
         }
         __syncthreads();
 
@@ -1284,9 +1254,9 @@ static void set_rows_cuda_tbq34(
         const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM, seed, stream);
 
         const size_t shared_bytes =
-            size_t(QK_K) * sizeof(float) +
+            2 * size_t(QK_K) * sizeof(float) +
             size_t(CUDA_SET_ROWS_BLOCK_SIZE) * sizeof(float) +
-            2 * size_t(QK_K) * sizeof(uint8_t);
+            size_t(QK_K) * sizeof(uint8_t);
         GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
         const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
@@ -1326,8 +1296,8 @@ static void set_rows_cuda_tbqp3(
 
     if (ne_rows > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
         const uint64_t seed = turboq_seed_from_row(0);
-        const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM, seed, stream);
-        const float * d_S = tbq_get_projection_device(TURBOQ_KV_DIM, seed, stream);
+        const float * d_Q = tbq_get_rotation_device(QK_K, seed, stream);
+        const float * d_S = tbq_get_projection_device(QK_K, seed, stream);
 
         const size_t shared_bytes =
             2 * size_t(QK_K) * sizeof(float) +
@@ -1372,8 +1342,8 @@ static void set_rows_cuda_tbqp4(
 
     if (ne_rows > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
         const uint64_t seed = turboq_seed_from_row(0);
-        const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM, seed, stream);
-        const float * d_S = tbq_get_projection_device(TURBOQ_KV_DIM, seed, stream);
+        const float * d_Q = tbq_get_rotation_device(QK_K, seed, stream);
+        const float * d_S = tbq_get_projection_device(QK_K, seed, stream);
 
         const size_t shared_bytes =
             2 * size_t(QK_K) * sizeof(float) +
@@ -1418,8 +1388,8 @@ static void set_rows_cuda_tbqp34(
 
     if (ne_rows > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
         const uint64_t seed = turboq_seed_from_row(0);
-        const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM, seed, stream);
-        const float * d_S = tbq_get_projection_device(TURBOQ_KV_DIM, seed, stream);
+        const float * d_Q = tbq_get_rotation_device(QK_K, seed, stream);
+        const float * d_S = tbq_get_projection_device(QK_K, seed, stream);
 
         const size_t shared_bytes =
             2 * size_t(QK_K) * sizeof(float) +

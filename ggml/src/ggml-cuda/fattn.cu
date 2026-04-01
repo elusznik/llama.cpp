@@ -229,6 +229,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ34_0,  GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQP34_0, GGML_TYPE_F16)
 
 #ifdef GGML_CUDA_FA_ALL_QUANTS
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
@@ -550,3 +552,9 @@ template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TBQP3_0, GGML_TYP
 template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_TBQP4_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_TBQP4_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TBQP4_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_TBQ34_0,  GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_TBQ34_0,  GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TBQ34_0,  GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_TBQP34_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_TBQP34_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TBQP34_0, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

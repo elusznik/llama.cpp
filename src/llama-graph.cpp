@@ -1963,6 +1963,24 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il) const {
+    constexpr int64_t turboq_mixed_outlier_ch = 64;
+
+    const auto tbq_split_outlier_ch = [&](ggml_tensor * lo, ggml_tensor * hi, uint32_t requested) -> int64_t {
+        if (requested > 0) {
+            return requested;
+        }
+
+        if (lo == nullptr || hi == nullptr) {
+            return 0;
+        }
+
+        const bool is_tbq34_alias =
+                (lo->type == GGML_TYPE_TBQ3_0  && hi->type == GGML_TYPE_TBQ4_0) ||
+                (lo->type == GGML_TYPE_TBQP3_0 && hi->type == GGML_TYPE_TBQP4_0);
+
+        return is_tbq34_alias ? turboq_mixed_outlier_ch : 0;
+    };
+
     const bool k_is_split = k_out != nullptr;
     const bool v_is_split = v_out != nullptr;
     const bool v_trans = v->nb[1] > v->nb[2];
@@ -1970,10 +1988,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         k->type == GGML_TYPE_TBQP3_0 || k->type == GGML_TYPE_TBQP4_0 || k->type == GGML_TYPE_TBQP34_0;
     const bool v_is_tbq = v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0 || v->type == GGML_TYPE_TBQ34_0 ||
         v->type == GGML_TYPE_TBQP3_0 || v->type == GGML_TYPE_TBQP4_0 || v->type == GGML_TYPE_TBQP34_0;
-    // Disable flash attention for TBQ34/TBQP34 standalone - concat in restore path only supports F32
-    const bool k_is_tbq34_standalone = (k->type == GGML_TYPE_TBQ34_0 || k->type == GGML_TYPE_TBQP34_0) && !k_is_split;
-    const bool v_is_tbq34_standalone = (v->type == GGML_TYPE_TBQ34_0 || v->type == GGML_TYPE_TBQP34_0) && !v_is_split;
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !k_is_tbq34_standalone && !v_is_tbq34_standalone;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     const enum ggml_type tbq_attn_type = use_flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
     // TBQP34_0/TBQ34_0 standalone don't need special flash attention handling
     const bool k_tbqp_cpu_flash = use_flash_attn &&
@@ -1991,6 +2006,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool v_tbq_split_cpu_flash = use_flash_attn && v_is_split && v_is_tbq &&
         v->buffer != nullptr && ggml_backend_buffer_is_host(v->buffer) &&
         v_out->buffer != nullptr && ggml_backend_buffer_is_host(v_out->buffer);
+    const int64_t n_outlier_k = tbq_split_outlier_ch(k, k_out, cparams.n_outlier_k_ch);
+    const int64_t n_outlier_v = tbq_split_outlier_ch(v, v_out, cparams.n_outlier_v_ch);
     const int64_t n_embd_v_reg_split = v_is_split ? v->ne[0] : 0;
     const int64_t n_embd_v_out_split = v_is_split ? v_out->ne[0] : 0;
     // split the batch into streams if needed
@@ -2002,7 +2019,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     if (k_is_split && k->type != GGML_TYPE_TBQ34_0 && k->type != GGML_TYPE_TBQP34_0) {
         const int64_t n_head_kv = hparams.n_head_kv(il);
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
-        const int64_t n_outlier = cparams.n_outlier_k_ch;
         const int64_t n_embd_k_reg = k->ne[0];
         const int64_t n_embd_k_out = k_out->ne[0];
 
@@ -2017,7 +2033,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cb(k, use_flash_attn ? "k_tbq_split_f16" : "k_tbq_split_f32", il);
             cb(k_out, use_flash_attn ? "k_tbq_out_f16" : "k_tbq_out_f32", il);
 
-            k = llm_graph_rebuild_split_tbq(ctx0, k, k_out, k_perm, n_embd_head, n_head_kv, n_outlier);
+            k = llm_graph_rebuild_split_tbq(ctx0, k, k_out, k_perm, n_embd_head, n_head_kv, n_outlier_k);
             cb(k, "k_tbq_split_reshaped", il);
             k_out = nullptr;
         }
@@ -2037,11 +2053,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(n_head_kv > 0);
         GGML_ASSERT(n_embd_k_gqa % n_head_kv == 0);
 
-        k = ggml_cast(ctx0, k, tbq_attn_type);
-        cb(k, use_flash_attn ? "k_tbq_f16" : "k_tbq_f32", il);
+        // For TBQ types with FA, don't cast to F16 - FA needs to see the original type
+        // to dispatch to the correct TBQ-specific kernel
+        if (!use_flash_attn) {
+            k = ggml_cast(ctx0, k, tbq_attn_type);
+            cb(k, "k_tbq_f32", il);
+        } else {
+            cb(k, "k_tbq_quant", il);
+        }
 
-        // TBQ34/TBQP34 standalone: skip llm_graph_restore_packed_tbq (concat doesn't support F16 on CUDA)
-        // but still do the reshape needed for attention
+        // TBQ34/TBQP34 standalone: skip llm_graph_restore_packed_tbq but still reshape
         k = ggml_reshape_4d(ctx0, k, n_embd_k_gqa / n_head_kv, n_head_kv, k->ne[1], k->ne[2]);
         cb(k, "k_tbq_reshaped", il);
     }
@@ -2050,7 +2071,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     if (v_is_split && v->type != GGML_TYPE_TBQ34_0 && v->type != GGML_TYPE_TBQP34_0) {
         const int64_t n_head_kv = hparams.n_head_kv(il);
         const int64_t n_embd_head = hparams.n_embd_head_v(il);
-        const int64_t n_outlier = cparams.n_outlier_v_ch;
 
         if (v_tbq_split_cpu_flash) {
             v = llm_graph_view_tbq_split_for_fattn(ctx0, v, n_embd_head, n_head_kv);
@@ -2063,7 +2083,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cb(v, use_flash_attn ? "v_tbq_split_f16" : "v_tbq_split_f32", il);
             cb(v_out, use_flash_attn ? "v_tbq_out_f16" : "v_tbq_out_f32", il);
 
-            v = llm_graph_rebuild_split_tbq(ctx0, v, v_out, v_perm, n_embd_head, n_head_kv, n_outlier);
+            v = llm_graph_rebuild_split_tbq(ctx0, v, v_out, v_perm, n_embd_head, n_head_kv, n_outlier_v);
             cb(v, "v_tbq_split_reshaped", il);
             v_out = nullptr;
         }
@@ -2120,22 +2140,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
 
         if (k->type == GGML_TYPE_TBQP34_0) {
-            llm_graph_set_op_params_i32(cur, 4, (int32_t) cparams.n_outlier_k_ch);
+            llm_graph_set_op_params_i32(cur, 4, (int32_t) n_outlier_k);
             cur->src[7] = k_perm;
         }
         if (v->type == GGML_TYPE_TBQ34_0 || v->type == GGML_TYPE_TBQP34_0) {
-            llm_graph_set_op_params_i32(cur, 5, (int32_t) cparams.n_outlier_v_ch);
+            llm_graph_set_op_params_i32(cur, 5, (int32_t) n_outlier_v);
             cur->src[8] = v_perm;
         }
 
         if (k_tbqp_split_cpu_flash) {
             cur->src[5] = k_out;
-            llm_graph_set_op_params_i32(cur, 4, (int32_t) cparams.n_outlier_k_ch);
+            llm_graph_set_op_params_i32(cur, 4, (int32_t) n_outlier_k);
             cur->src[7] = k_perm;
         }
         if (v_tbq_split_cpu_flash) {
             cur->src[6] = v_out;
-            llm_graph_set_op_params_i32(cur, 5, (int32_t) cparams.n_outlier_v_ch);
+            llm_graph_set_op_params_i32(cur, 5, (int32_t) n_outlier_v);
             llm_graph_set_op_params_i32(cur, 6, (int32_t) n_embd_v_reg_split);
             llm_graph_set_op_params_i32(cur, 7, (int32_t) n_embd_v_out_split);
             cur->src[8] = v_perm;

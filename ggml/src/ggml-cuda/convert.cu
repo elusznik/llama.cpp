@@ -265,14 +265,12 @@ static __global__ void dequantize_row_tbqp3_nc(
         s_signs[tid] = ((row[block_idx].signs[tid / 8] >> (tid % 8)) & 1u) ? 1.0f : -1.0f;
         __syncthreads();
 
-        // Blockwise 128x128 matvecs: Q^T @ mse_rot and S @ signs
-        const int half = tid / TURBOQ_KV_DIM;
-        const int col  = tid % TURBOQ_KV_DIM;
+        // Full QK_K x QK_K matvecs: Q^T @ mse_rot and S @ signs
         float mse_sum = 0.0f;
         float qjl_sum = 0.0f;
-        for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
-            mse_sum += Q[j*TURBOQ_KV_DIM + col] * s_mse_rot[half * TURBOQ_KV_DIM + j];
-            qjl_sum += S[j*TURBOQ_KV_DIM + col] * s_signs[half * TURBOQ_KV_DIM + j];
+        for (int j = 0; j < QK_K; ++j) {
+            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+            qjl_sum += S[tid*QK_K + j] * s_signs[j];
         }
         out[base + tid] = ggml_cuda_cast<dst_t>(norm * (mse_sum + qjl_f * qjl_sum));
         __syncthreads();
@@ -331,14 +329,12 @@ static __global__ void dequantize_row_tbqp4_nc(
         s_signs[tid] = ((row[block_idx].signs[tid / 8] >> (tid % 8)) & 1u) ? 1.0f : -1.0f;
         __syncthreads();
 
-        // Blockwise 128x128 matvecs: Q^T @ mse_rot and S @ signs
-        const int half = tid / TURBOQ_KV_DIM;
-        const int col  = tid % TURBOQ_KV_DIM;
+        // Full QK_K x QK_K matvecs: Q^T @ mse_rot and S @ signs
         float mse_sum = 0.0f;
         float qjl_sum = 0.0f;
-        for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
-            mse_sum += Q[j*TURBOQ_KV_DIM + col] * s_mse_rot[half * TURBOQ_KV_DIM + j];
-            qjl_sum += S[j*TURBOQ_KV_DIM + col] * s_signs[half * TURBOQ_KV_DIM + j];
+        for (int j = 0; j < QK_K; ++j) {
+            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+            qjl_sum += S[tid*QK_K + j] * s_signs[j];
         }
         out[base + tid] = ggml_cuda_cast<dst_t>(norm * (mse_sum + qjl_f * qjl_sum));
         __syncthreads();
@@ -430,14 +426,13 @@ static __global__ void dequantize_row_tbq34_nc(
         // - indices 64-127 (outlier): 4-bit from qs_hi
         float val;
         if (in_half < 64) {
-            // Regular channel: 3-bit from qs_lo
-            // qs_lo layout: half0 bytes 0-23, half1 bytes 24-47 (48 bytes total for 128 3-bit values)
-            // 3 bits per value, 8 values per 3 bytes
-            const int lo_half_off = half * 24;  // byte offset for this half
-            const int val_idx = in_half;  // 0-63
-            const int byte_idx = lo_half_off + (val_idx * 3) / 8;
-            const int bit_shift = (val_idx * 3) % 8;
-            const uint8_t bits = row[block_idx].qs_lo[byte_idx];
+            // Regular channel: 3-bit from qs_lo.
+            // Each half stores 64 regular values in 24 bytes, packed as 8 values / 3 bytes.
+            const int lo_half_off = half * 24;
+            const int group = in_half / 8;
+            const int bit_shift = (in_half % 8) * 3;
+            const uint8_t * qs = row[block_idx].qs_lo + lo_half_off + group * 3;
+            const uint32_t bits = uint32_t(qs[0]) | (uint32_t(qs[1]) << 8) | (uint32_t(qs[2]) << 16);
             const uint8_t idx = (bits >> bit_shift) & 0x7u;
             val = tbq3_codebook_value(idx) * scale_down;
         } else {
@@ -499,8 +494,8 @@ static void dequantize_row_tbqp3_nc_cuda(
     const int64_t ne0203 = ne02 * ne03;
     const int64_t nrows = ne01 * ne0203;
     const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
-    const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM);
-    const float * d_S = tbq_get_projection_device(TURBOQ_KV_DIM);
+    const float * d_Q = tbq_get_rotation_device(QK_K);
+    const float * d_S = tbq_get_projection_device(QK_K);
     const size_t shared_bytes = 2 * size_t(QK_K) * sizeof(float);
 
     GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
@@ -520,8 +515,8 @@ static void dequantize_row_tbqp4_nc_cuda(
     const int64_t ne0203 = ne02 * ne03;
     const int64_t nrows = ne01 * ne0203;
     const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
-    const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM);
-    const float * d_S = tbq_get_projection_device(TURBOQ_KV_DIM);
+    const float * d_Q = tbq_get_rotation_device(QK_K);
+    const float * d_S = tbq_get_projection_device(QK_K);
     const size_t shared_bytes = 2 * size_t(QK_K) * sizeof(float);
 
     GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
@@ -607,13 +602,12 @@ static __global__ void dequantize_row_tbqp34_nc(
         s_signs[tid] = ((row[block_idx].signs[tid / 8] >> (tid % 8)) & 1u) ? 1.0f : -1.0f;
         __syncthreads();
 
-        // Blockwise 128x128 matvecs: Q^T @ mse_rot and S @ signs
-        const int col = tid % TURBOQ_KV_DIM;
+        // Full QK_K x QK_K matvecs: Q^T @ mse_rot and S @ signs
         float mse_sum = 0.0f;
         float qjl_sum = 0.0f;
-        for (int j = 0; j < TURBOQ_KV_DIM; ++j) {
-            mse_sum += Q[j*TURBOQ_KV_DIM + col] * s_mse_rot[half * TURBOQ_KV_DIM + j];
-            qjl_sum += S[j*TURBOQ_KV_DIM + col] * s_signs[half * TURBOQ_KV_DIM + j];
+        for (int j = 0; j < QK_K; ++j) {
+            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+            qjl_sum += S[tid*QK_K + j] * s_signs[j];
         }
         out[base + tid] = ggml_cuda_cast<dst_t>(norm * (mse_sum + qjl_f * qjl_sum));
         __syncthreads();
@@ -630,8 +624,8 @@ static void dequantize_row_tbqp34_nc_cuda(
     const int64_t ne0203 = ne02 * ne03;
     const int64_t nrows = ne01 * ne0203;
     const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
-    const float * d_Q = tbq_get_rotation_device(TURBOQ_KV_DIM);
-    const float * d_S = tbq_get_projection_device(TURBOQ_KV_DIM);
+    const float * d_Q = tbq_get_rotation_device(QK_K);
+    const float * d_S = tbq_get_projection_device(QK_K);
     const size_t shared_bytes = 2 * size_t(QK_K) * sizeof(float);
 
     GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);

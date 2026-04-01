@@ -402,22 +402,21 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3(
     GGML_UNUSED(Q_q8);
 
     const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
-    const float norm = __half2float((half) K_tbqp3[0].d);
-    const float gamma = __half2float((half) K_tbqp3[0].gamma);
+    const float norm = __half2float(K_tbqp3[0].d);
+    const float gamma = __half2float(K_tbqp3[0].gamma);
     const float scale_down = 1.0f / sqrtf((float) QK_K);
     const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) QK_K;
 
+    // Compute rotary sum with per-position QJL term (matches TBQP34 and CUDA dequantization)
     float sum = 0.0f;
-
-#pragma unroll
     for (int i = lane; i < D; i += nthreads) {
         const int block_idx = i / QK_K;
         const int in_block = i % QK_K;
         const uint8_t idx = (K_tbqp3[block_idx].qs[in_block / 4] >> ((in_block % 4) * 2)) & 0x3u;
         const float sign = ((K_tbqp3[block_idx].signs[in_block / 8] >> (in_block % 8)) & 1u) ? 1.0f : -1.0f;
-
         sum += q_rot[i] * tbq2_codebook_value_fattn(idx) * scale_down + qjl_f * q_proj[i] * sign;
     }
+    sum = warp_reduce_sum<32>(sum);
 
     return norm * sum;
 }
@@ -432,7 +431,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3(
     GGML_UNUSED(Q_ds_v);
 
     const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
-    const float norm = __half2float((half) K_tbq3[0].d);
+    const float norm = __half2float(K_tbq3[0].d);
     const float scale_down = 1.0f / sqrtf((float) D);
 
     float sum = 0.0f;
@@ -463,14 +462,13 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4(
     GGML_UNUSED(Q_q8);
 
     const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
-    const float norm = __half2float((half) K_tbqp4[0].d);
-    const float gamma = __half2float((half) K_tbqp4[0].gamma);
+    const float norm = __half2float(K_tbqp4[0].d);
+    const float gamma = __half2float(K_tbqp4[0].gamma);
     const float scale_down = 1.0f / sqrtf((float) QK_K);
     const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) QK_K;
 
+    // Compute rotary sum with per-position QJL term (matches TBQP34 and CUDA dequantization)
     float sum = 0.0f;
-
-#pragma unroll
     for (int i = lane; i < D; i += nthreads) {
         const int block_idx = i / QK_K;
         const int in_block = i % QK_K;
@@ -480,9 +478,9 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4(
         const uint32_t bits = uint32_t(qs[0]) | (uint32_t(qs[1]) << 8) | (uint32_t(qs[2]) << 16);
         const uint8_t idx = (bits >> shift) & 0x7u;
         const float sign = ((K_tbqp4[block_idx].signs[in_block / 8] >> (in_block % 8)) & 1u) ? 1.0f : -1.0f;
-
         sum += q_rot[i] * tbq3_codebook_value_fattn(idx) * scale_down + qjl_f * q_proj[i] * sign;
     }
+    sum = warp_reduce_sum<32>(sum);
 
     return norm * sum;
 }
@@ -497,7 +495,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4(
     GGML_UNUSED(Q_ds_v);
 
     const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
-    const float norm = __half2float((half) K_tbq4[0].d);
+    const float norm = __half2float(K_tbq4[0].d);
     const float scale_down = 1.0f / sqrtf((float) D);
 
     float sum = 0.0f;
@@ -520,42 +518,44 @@ template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq34(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
-    const block_tbq34_0 * K_tbq34 = (const block_tbq34_0 *) K_c;
+    const int head = Q_q8 ? *Q_q8 : 0;
+    const int half = head % 2; // 2 heads per 256-element block since D=128
+    const int offset_bytes = half * (sizeof(block_tbq34_0) / 2);
+    // K_c was incremented by (head * 57) in fattn-vec.cuh, reverse this offset to find the block start
+    const block_tbq34_0 * K_tbq34 = (const block_tbq34_0 *) (K_c - offset_bytes);
+    
     const float * q_rot = (const float *) Q_v;
-    GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
     const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
-    const float norm = __half2float((half) K_tbq34[0].d);
+    
+    // Evaluate norm ONCE per thread 
+    const float norm = __half2float(K_tbq34[0].d);
+    
     const float scale_down = 1.0f / sqrtf((float) D);
 
     float sum = 0.0f;
 
 #pragma unroll
     for (int i = lane; i < D; i += nthreads) {
-        const int half = i / 64;  // 0 or 1 for two 64-channel halves
-        const int in_half = i % 64;  // 0-63 within the half
+        // D is 128, so we are always processing a single half block here, based on the head
+        const int in_half = i;
 
         float val;
-        if (in_half < 32) {
+        if (in_half < 64) {
             // Regular channel: 3-bit from qs_lo
-            // qs_lo layout: half0 bytes 0-23, half1 bytes 24-47 (48 bytes for 128 3-bit values)
-            // 3 bits per value, 8 values per 3 bytes
-            const int lo_half_off = half * 24;
-            const int val_idx = in_half;  // 0-31 but we need 0-63
-            const int byte_idx = lo_half_off + (val_idx * 3) / 8;
-            const int bit_shift = (val_idx * 3) % 8;
-            const uint8_t bits = K_tbq34[half].qs_lo[byte_idx];
-            const uint8_t idx = (bits >> bit_shift) & 0x7u;
+            const int group = in_half / 8;
+            const int shift = (in_half % 8) * 3;
+            const uint8_t * qs = K_tbq34[0].qs_lo + half * 24 + group * 3;
+            const uint32_t bits = uint32_t(qs[0]) | (uint32_t(qs[1]) << 8) | (uint32_t(qs[2]) << 16);
+            const uint8_t idx = (bits >> shift) & 0x7u;
             val = tbq3_codebook_value_fattn(idx) * scale_down;
         } else {
             // Outlier channel: 4-bit from qs_hi
-            // qs_hi layout: half0 bytes 0-31, half1 bytes 32-63 (64 bytes for 128 4-bit values)
-            const int hi_half_off = half * 32;
-            const int val_idx = in_half - 32;  // Map to 0-31 range
-            const int byte_idx = hi_half_off + val_idx / 2;
-            const int bit_shift = (val_idx % 2) * 4;
-            const uint8_t bits = K_tbq34[half].qs_hi[byte_idx];
+            const int qs_idx = in_half - 64;
+            const int byte_idx = half * 32 + qs_idx / 2;
+            const int bit_shift = (qs_idx % 2) * 4;
+            const uint8_t bits = K_tbq34[0].qs_hi[byte_idx];
             const uint8_t idx = (bits >> bit_shift) & 0xFu;
             val = tbq4_codebook_value_fattn(idx) * scale_down;
         }
@@ -578,14 +578,13 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp34(
     GGML_UNUSED(Q_q8);
 
     const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
-    const float norm = __half2float((half) K_tbqp34[0].d);
-    const float gamma = __half2float((half) K_tbqp34[0].gamma);
+    const float norm = __half2float(K_tbqp34[0].d);
+    const float gamma = __half2float(K_tbqp34[0].gamma);
     const float scale_down = 1.0f / sqrtf((float) QK_K);
     const float qjl_f = sqrtf((float) M_PI / 2.0f) * gamma / (float) QK_K;
 
+    // Compute rotary sum with per-position QJL term (matches CUDA dequantization)
     float sum = 0.0f;
-
-#pragma unroll
     for (int i = lane; i < D; i += nthreads) {
         const int half = i / 64;  // 0 or 1 for two 64-channel halves
         const int in_half = i % 64;  // 0-63 within the half
@@ -594,32 +593,31 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp34(
         float sign = 1.0f;
         if (in_half < 32) {
             // Regular channel: 2-bit from qs_lo + sign
-            // qs_lo layout: half0 bytes 0-15, half1 bytes 16-31 (32 bytes for 128 2-bit values)
-            // 2 bits per value, 4 values per byte
             const int lo_half_off = half * 16;
-            const int val_idx = in_half;  // 0-31 but we need 0-63
+            const int val_idx = in_half;
             const int byte_idx = lo_half_off + val_idx / 4;
             const int bit_shift = (val_idx % 4) * 2;
             const uint8_t bits = K_tbqp34[half].qs_lo[byte_idx];
             const uint8_t idx = (bits >> bit_shift) & 0x3u;
             val = tbq2_codebook_value_fattn(idx) * scale_down;
-            // signs layout: 32 bytes for 256 bits, indexed linearly by i
+            // Regular channel has sign
             const int sign_idx = in_half + half * 64;
             sign = ((K_tbqp34[half].signs[sign_idx / 8] >> (sign_idx % 8)) & 1u) ? 1.0f : -1.0f;
         } else {
             // Outlier channel: 3-bit from qs_hi (no sign)
-            // qs_hi layout: half0 bytes 0-23, half1 bytes 24-47 (48 bytes for 128 3-bit values)
             const int hi_half_off = half * 24;
-            const int val_idx = in_half - 32;  // Map to 0-31 range
+            const int val_idx = in_half - 32;
             const int byte_idx = hi_half_off + (val_idx * 3) / 8;
             const int bit_shift = (val_idx * 3) % 8;
             const uint8_t bits = K_tbqp34[half].qs_hi[byte_idx];
             const uint8_t idx = (bits >> bit_shift) & 0x7u;
             val = tbq3_codebook_value_fattn(idx) * scale_down;
+            // Outlier channel has no sign, so sign = 1.0f
         }
 
         sum += q_rot[i] * val + qjl_f * q_proj[i] * sign;
     }
+    sum = warp_reduce_sum<32>(sum);
 
     return norm * sum;
 }
