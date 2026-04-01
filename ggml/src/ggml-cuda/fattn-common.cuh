@@ -72,9 +72,89 @@ static const float * ggml_cuda_turboq_get_rotation_device(const int d, cudaStrea
     return ggml_cuda_turboq_get_matrix_device(g_turboq_fattn_rotation_cache, d, turboq_get_rotation);
 }
 
+static const float * ggml_cuda_turboq_get_rotation_row_device(const int d, cudaStream_t stream) {
+    GGML_UNUSED(stream);
+
+    const int device = ggml_cuda_get_device();
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    auto & cache = g_turboq_fattn_rotation_cache[device];
+    if (cache.d_M != nullptr && cache.d == d && cache.seed == seed) {
+        return cache.d_M;
+    }
+
+    if (cache.d_M != nullptr) {
+        CUDA_CHECK(cudaFree(cache.d_M));
+        cache.d_M = nullptr;
+        cache.d   = 0;
+    }
+
+    const float * M_host = turboq_get_rotation(d, seed);
+    const size_t n       = size_t(d) * size_t(d);
+    float * M_row_host   = (float *) malloc(n * sizeof(float));
+    GGML_ASSERT(M_row_host != nullptr);
+
+    for (int i = 0; i < d; ++i) {
+        for (int j = 0; j < d; ++j) {
+            M_row_host[i * d + j] = M_host[i + j * d];
+        }
+    }
+
+    CUDA_CHECK(cudaMalloc(&cache.d_M, n * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(cache.d_M, M_row_host, n * sizeof(float), cudaMemcpyHostToDevice));
+
+    free(M_row_host);
+
+    cache.d    = d;
+    cache.seed = seed;
+
+    return cache.d_M;
+}
+
 static const float * ggml_cuda_turboq_get_projection_device(const int d, cudaStream_t stream) {
     GGML_UNUSED(stream);
     return ggml_cuda_turboq_get_matrix_device(g_turboq_fattn_projection_cache, d, turboq_get_projection);
+}
+
+static const float * ggml_cuda_turboq_get_projection_row_device(const int d, cudaStream_t stream) {
+    GGML_UNUSED(stream);
+
+    const int device = ggml_cuda_get_device();
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+
+    const uint64_t seed = turboq_seed_from_row(0);
+    auto & cache = g_turboq_fattn_projection_cache[device];
+    if (cache.d_M != nullptr && cache.d == d && cache.seed == seed) {
+        return cache.d_M;
+    }
+
+    if (cache.d_M != nullptr) {
+        CUDA_CHECK(cudaFree(cache.d_M));
+        cache.d_M = nullptr;
+        cache.d   = 0;
+    }
+
+    const float * M_host = turboq_get_projection(d, seed);
+    const size_t n       = size_t(d) * size_t(d);
+    float * M_row_host   = (float *) malloc(n * sizeof(float));
+    GGML_ASSERT(M_row_host != nullptr);
+
+    for (int i = 0; i < d; ++i) {
+        for (int j = 0; j < d; ++j) {
+            M_row_host[i * d + j] = M_host[i + j * d];
+        }
+    }
+
+    CUDA_CHECK(cudaMalloc(&cache.d_M, n * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(cache.d_M, M_row_host, n * sizeof(float), cudaMemcpyHostToDevice));
+
+    free(M_row_host);
+
+    cache.d    = d;
+    cache.seed = seed;
+
+    return cache.d_M;
 }
 
 typedef void (* fattn_kernel_t)(
@@ -416,7 +496,6 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3(
         const float sign = ((K_tbqp3[block_idx].signs[in_block / 8] >> (in_block % 8)) & 1u) ? 1.0f : -1.0f;
         sum += q_rot[i] * tbq2_codebook_value_fattn(idx) * scale_down + qjl_f * q_proj[i] * sign;
     }
-    sum = warp_reduce_sum<32>(sum);
 
     return norm * sum;
 }
@@ -480,7 +559,6 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4(
         const float sign = ((K_tbqp4[block_idx].signs[in_block / 8] >> (in_block % 8)) & 1u) ? 1.0f : -1.0f;
         sum += q_rot[i] * tbq3_codebook_value_fattn(idx) * scale_down + qjl_f * q_proj[i] * sign;
     }
-    sum = warp_reduce_sum<32>(sum);
 
     return norm * sum;
 }
@@ -617,7 +695,6 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp34(
 
         sum += q_rot[i] * val + qjl_f * q_proj[i] * sign;
     }
-    sum = warp_reduce_sum<32>(sum);
 
     return norm * sum;
 }
@@ -1257,11 +1334,13 @@ void launch_fattn(
     }
 
     if (!need_f16_K && (K_is_tbq || K_is_tbqp)) {
-        turboq_Q = ggml_cuda_turboq_get_rotation_device(K_is_tbq ? TURBOQ_KV_DIM : (int) K->ne[0], main_stream);
+        turboq_Q = K_is_tbqp
+            ? ggml_cuda_turboq_get_rotation_row_device((int) K->ne[0], main_stream)
+            : ggml_cuda_turboq_get_rotation_device(TURBOQ_KV_DIM, main_stream);
     }
 
     if (!need_f16_K && K_is_tbqp) {
-        turboq_S = ggml_cuda_turboq_get_projection_device((int) K->ne[0], main_stream);
+        turboq_S = ggml_cuda_turboq_get_projection_row_device((int) K->ne[0], main_stream);
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {

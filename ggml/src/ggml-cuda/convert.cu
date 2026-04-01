@@ -269,7 +269,7 @@ static __global__ void dequantize_row_tbqp3_nc(
         float mse_sum = 0.0f;
         float qjl_sum = 0.0f;
         for (int j = 0; j < QK_K; ++j) {
-            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+            mse_sum += Q[tid*QK_K + j] * s_mse_rot[j];
             qjl_sum += S[tid*QK_K + j] * s_signs[j];
         }
         out[base + tid] = ggml_cuda_cast<dst_t>(norm * (mse_sum + qjl_f * qjl_sum));
@@ -319,7 +319,7 @@ static __global__ void dequantize_row_tbqp3_mse_nc(
 
         float mse_sum = 0.0f;
         for (int j = 0; j < QK_K; ++j) {
-            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+            mse_sum += Q[tid*QK_K + j] * s_mse_rot[j];
         }
         out[base + tid] = ggml_cuda_cast<dst_t>(norm * mse_sum);
         __syncthreads();
@@ -382,7 +382,7 @@ static __global__ void dequantize_row_tbqp4_nc(
         float mse_sum = 0.0f;
         float qjl_sum = 0.0f;
         for (int j = 0; j < QK_K; ++j) {
-            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+            mse_sum += Q[tid*QK_K + j] * s_mse_rot[j];
             qjl_sum += S[tid*QK_K + j] * s_signs[j];
         }
         out[base + tid] = ggml_cuda_cast<dst_t>(norm * (mse_sum + qjl_f * qjl_sum));
@@ -436,7 +436,7 @@ static __global__ void dequantize_row_tbqp4_mse_nc(
 
         float mse_sum = 0.0f;
         for (int j = 0; j < QK_K; ++j) {
-            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+            mse_sum += Q[tid*QK_K + j] * s_mse_rot[j];
         }
         out[base + tid] = ggml_cuda_cast<dst_t>(norm * mse_sum);
         __syncthreads();
@@ -748,7 +748,7 @@ static __global__ void dequantize_row_tbqp34_nc(
         float mse_sum = 0.0f;
         float qjl_sum = 0.0f;
         for (int j = 0; j < QK_K; ++j) {
-            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+            mse_sum += Q[tid*QK_K + j] * s_mse_rot[j];
             qjl_sum += S[tid*QK_K + j] * s_signs[j];
         }
         out[base + tid] = ggml_cuda_cast<dst_t>(norm * (mse_sum + qjl_f * qjl_sum));
@@ -816,7 +816,7 @@ static __global__ void dequantize_row_tbqp34_mse_nc(
 
         float mse_sum = 0.0f;
         for (int j = 0; j < QK_K; ++j) {
-            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+            mse_sum += Q[tid*QK_K + j] * s_mse_rot[j];
         }
         out[base + tid] = ggml_cuda_cast<dst_t>(norm * mse_sum);
         __syncthreads();

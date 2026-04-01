@@ -604,7 +604,7 @@ static __global__ void k_set_rows_tbqp3(
         {
             float mse_sum = 0.0f;
             for (int j = 0; j < QK_K; ++j) {
-                mse_sum += Q[j*QK_K + tid] * s_tmp[j];
+                mse_sum += Q[tid*QK_K + j] * s_tmp[j];
             }
             const float residual = s_row[tid] - mse_sum;
             s_row[tid] = residual;
@@ -796,7 +796,7 @@ static __global__ void k_set_rows_tbqp4(
         {
             float mse_sum = 0.0f;
             for (int j = 0; j < QK_K; ++j) {
-                mse_sum += Q[j*QK_K + tid] * s_tmp[j];
+                mse_sum += Q[tid*QK_K + j] * s_tmp[j];
             }
             const float residual = s_row[tid] - mse_sum;
             s_row[tid] = residual;
