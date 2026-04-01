@@ -30,6 +30,7 @@ typedef to_t_nc_cuda_t<nv_bfloat16> to_bf16_nc_cuda_t;
 to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type);
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type);
 to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type);
+to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda_tbqp_mse(ggml_type type);
 
 template<typename dst_t, typename src_t>
  __host__ __device__ inline dst_t ggml_cuda_cast(src_t x) {

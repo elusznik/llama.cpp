@@ -1224,6 +1224,8 @@ void launch_fattn(
                           K->type == GGML_TYPE_TBQ34_0;
     const bool K_is_tbqp = K->type == GGML_TYPE_TBQP3_0 || K->type == GGML_TYPE_TBQP4_0 ||
                            K->type == GGML_TYPE_TBQP34_0;
+    const bool V_is_tbqp = V->type == GGML_TYPE_TBQP3_0 || V->type == GGML_TYPE_TBQP4_0 ||
+                           V->type == GGML_TYPE_TBQP34_0;
     const float * turboq_Q = nullptr;
     const float * turboq_S = nullptr;
 
@@ -1273,7 +1275,7 @@ void launch_fattn(
             const size_t ts = ggml_type_size(V->type);
 
             V_f16.alloc(ggml_nelements(V));
-            if (ggml_is_contiguously_allocated(V)) {
+            if (!V_is_tbqp && ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
                 V_data = (char *) V_f16.ptr;
@@ -1283,7 +1285,10 @@ void launch_fattn(
                 nb23 = nb23*bs*sizeof(half)/ts;
             } else {
                 GGML_ASSERT(V->nb[0] == ts);
-                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                to_fp16_nc_cuda_t to_fp16 = V_is_tbqp ?
+                    ggml_get_to_fp16_nc_cuda_tbqp_mse(V->type) :
+                    ggml_get_to_fp16_nc_cuda(V->type);
+                GGML_ASSERT(to_fp16 != nullptr);
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;

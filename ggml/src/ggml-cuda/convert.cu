@@ -278,6 +278,55 @@ static __global__ void dequantize_row_tbqp3_nc(
 }
 
 template<typename dst_t>
+static __global__ void dequantize_row_tbqp3_mse_nc(
+        const block_tbqp3_0 * __restrict__ vx,
+        dst_t * __restrict__ y,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne0203,
+        const uint3 ne02,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const float * __restrict__ Q) {
+    const int64_t row_id = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (row_id >= ne01 * ne0203) {
+        return;
+    }
+
+    const uint2 dm = fast_div_modulo((uint32_t) (row_id / ne01), ne02);
+    const int64_t i01 = row_id % ne01;
+    const int64_t i02 = dm.y;
+    const int64_t i03 = dm.x;
+
+    const block_tbqp3_0 * row = vx + i03*s03 + i02*s02 + i01*s01;
+    dst_t * out = y + row_id * ne00;
+
+    extern __shared__ float s_mse_rot[];
+    const float scale_down = 1.0f / sqrtf((float) QK_K);
+    const int64_t nb = ne00 / QK_K;
+
+    for (int64_t block_idx = 0; block_idx < nb; ++block_idx) {
+        const int64_t base = block_idx * QK_K;
+        const float norm = __half2float(row[block_idx].d);
+
+        const int64_t in_block = tid;
+        const uint8_t idx = (row[block_idx].qs[in_block / 4] >> ((in_block % 4) * 2)) & 0x3u;
+        s_mse_rot[tid] = tbq2_codebook_value(idx) * scale_down;
+        __syncthreads();
+
+        float mse_sum = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+        }
+        out[base + tid] = ggml_cuda_cast<dst_t>(norm * mse_sum);
+        __syncthreads();
+    }
+}
+
+template<typename dst_t>
 static __global__ void dequantize_row_tbqp4_nc(
         const block_tbqp4_0 * __restrict__ vx,
         dst_t * __restrict__ y,
@@ -337,6 +386,59 @@ static __global__ void dequantize_row_tbqp4_nc(
             qjl_sum += S[tid*QK_K + j] * s_signs[j];
         }
         out[base + tid] = ggml_cuda_cast<dst_t>(norm * (mse_sum + qjl_f * qjl_sum));
+        __syncthreads();
+    }
+}
+
+template<typename dst_t>
+static __global__ void dequantize_row_tbqp4_mse_nc(
+        const block_tbqp4_0 * __restrict__ vx,
+        dst_t * __restrict__ y,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne0203,
+        const uint3 ne02,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const float * __restrict__ Q) {
+    const int64_t row_id = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (row_id >= ne01 * ne0203) {
+        return;
+    }
+
+    const uint2 dm = fast_div_modulo((uint32_t) (row_id / ne01), ne02);
+    const int64_t i01 = row_id % ne01;
+    const int64_t i02 = dm.y;
+    const int64_t i03 = dm.x;
+
+    const block_tbqp4_0 * row = vx + i03*s03 + i02*s02 + i01*s01;
+    dst_t * out = y + row_id * ne00;
+
+    extern __shared__ float s_mse_rot[];
+    const float scale_down = 1.0f / sqrtf((float) QK_K);
+    const int64_t nb = ne00 / QK_K;
+
+    for (int64_t block_idx = 0; block_idx < nb; ++block_idx) {
+        const int64_t base = block_idx * QK_K;
+        const float norm = __half2float(row[block_idx].d);
+
+        const int64_t in_block = tid;
+        const int64_t group = in_block / 8;
+        const int64_t shift = (in_block % 8) * 3;
+        const uint8_t * qs = row[block_idx].qs + group * 3;
+        const uint32_t bits = uint32_t(qs[0]) | (uint32_t(qs[1]) << 8) | (uint32_t(qs[2]) << 16);
+        const uint8_t idx = (bits >> shift) & 0x7u;
+        s_mse_rot[tid] = tbq3_codebook_value(idx) * scale_down;
+        __syncthreads();
+
+        float mse_sum = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+        }
+        out[base + tid] = ggml_cuda_cast<dst_t>(norm * mse_sum);
         __syncthreads();
     }
 }
@@ -526,6 +628,46 @@ static void dequantize_row_tbqp4_nc_cuda(
             (const block_tbqp4_0 *) vx, y, ne00, ne01, ne0203, ne02_fd, s01, s02, s03, d_Q, d_S);
 }
 
+template<typename dst_t>
+static void dequantize_row_tbqp3_mse_nc_cuda(
+        const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+    const int64_t ne0203 = ne02 * ne03;
+    const int64_t nrows = ne01 * ne0203;
+    const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
+    const float * d_Q = tbq_get_rotation_device(QK_K);
+    const size_t shared_bytes = size_t(QK_K) * sizeof(float);
+
+    GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
+    GGML_ASSERT(nrows < UINT_MAX);
+
+    dequantize_row_tbqp3_mse_nc<<<nrows, QK_K, shared_bytes, stream>>>(
+            (const block_tbqp3_0 *) vx, y, ne00, ne01, ne0203, ne02_fd, s01, s02, s03, d_Q);
+}
+
+template<typename dst_t>
+static void dequantize_row_tbqp4_mse_nc_cuda(
+        const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+    const int64_t ne0203 = ne02 * ne03;
+    const int64_t nrows = ne01 * ne0203;
+    const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
+    const float * d_Q = tbq_get_rotation_device(QK_K);
+    const size_t shared_bytes = size_t(QK_K) * sizeof(float);
+
+    GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
+    GGML_ASSERT(nrows < UINT_MAX);
+
+    dequantize_row_tbqp4_mse_nc<<<nrows, QK_K, shared_bytes, stream>>>(
+            (const block_tbqp4_0 *) vx, y, ne00, ne01, ne0203, ne02_fd, s01, s02, s03, d_Q);
+}
+
 // TBQP34_0: mixed Q_prod 3.625-bit - 64 regular channels (2-bit) + 64 outlier channels (3-bit) per 128-wide half
 // Plus 1-bit QJL signs for all 256 elements
 template<typename dst_t>
@@ -615,6 +757,73 @@ static __global__ void dequantize_row_tbqp34_nc(
 }
 
 template<typename dst_t>
+static __global__ void dequantize_row_tbqp34_mse_nc(
+        const block_tbqp34_0 * __restrict__ vx,
+        dst_t * __restrict__ y,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne0203,
+        const uint3 ne02,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const float * __restrict__ Q) {
+    const int64_t row_id = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (row_id >= ne01 * ne0203) {
+        return;
+    }
+
+    const uint2 dm = fast_div_modulo((uint32_t) (row_id / ne01), ne02);
+    const int64_t i01 = row_id % ne01;
+    const int64_t i02 = dm.y;
+    const int64_t i03 = dm.x;
+
+    const block_tbqp34_0 * row = vx + i03*s03 + i02*s02 + i01*s01;
+    dst_t * out = y + row_id * ne00;
+
+    extern __shared__ float s_mse_rot[];
+    const float scale_down = 1.0f / sqrtf((float) QK_K);
+    const int64_t nb = ne00 / QK_K;
+
+    for (int64_t block_idx = 0; block_idx < nb; ++block_idx) {
+        const int64_t base = block_idx * QK_K;
+        const int half = tid / TURBOQ_KV_DIM;
+        const int in_half = tid % TURBOQ_KV_DIM;
+        const float norm = __half2float(row[block_idx].d);
+
+        float mse_val;
+        if (in_half < 64) {
+            const int lo_half_off = half * 16;
+            const int val_idx = in_half;
+            const int byte_idx = lo_half_off + val_idx / 4;
+            const int bit_shift = (val_idx % 4) * 2;
+            const uint8_t bits = row[block_idx].qs_lo[byte_idx];
+            const uint8_t idx = (bits >> bit_shift) & 0x3u;
+            mse_val = tbq2_codebook_value(idx) * scale_down;
+        } else {
+            const int hi_half_off = half * 24;
+            const int val_idx = in_half - 64;
+            const int byte_idx = hi_half_off + (val_idx * 3) / 8;
+            const int bit_shift = (val_idx * 3) % 8;
+            const uint8_t bits = row[block_idx].qs_hi[byte_idx];
+            const uint8_t idx = (bits >> bit_shift) & 0x7u;
+            mse_val = tbq3_codebook_value(idx) * scale_down;
+        }
+        s_mse_rot[tid] = mse_val;
+        __syncthreads();
+
+        float mse_sum = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            mse_sum += Q[j*QK_K + tid] * s_mse_rot[j];
+        }
+        out[base + tid] = ggml_cuda_cast<dst_t>(norm * mse_sum);
+        __syncthreads();
+    }
+}
+
+template<typename dst_t>
 static void dequantize_row_tbqp34_nc_cuda(
         const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -633,6 +842,26 @@ static void dequantize_row_tbqp34_nc_cuda(
 
     dequantize_row_tbqp34_nc<<<nrows, QK_K, shared_bytes, stream>>>(
             (const block_tbqp34_0 *) vx, y, ne00, ne01, ne0203, ne02_fd, s01, s02, s03, d_Q, d_S);
+}
+
+template<typename dst_t>
+static void dequantize_row_tbqp34_mse_nc_cuda(
+        const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+    const int64_t ne0203 = ne02 * ne03;
+    const int64_t nrows = ne01 * ne0203;
+    const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
+    const float * d_Q = tbq_get_rotation_device(QK_K);
+    const size_t shared_bytes = size_t(QK_K) * sizeof(float);
+
+    GGML_ASSERT(shared_bytes <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
+    GGML_ASSERT(nrows < UINT_MAX);
+
+    dequantize_row_tbqp34_mse_nc<<<nrows, QK_K, shared_bytes, stream>>>(
+            (const block_tbqp34_0 *) vx, y, ne00, ne01, ne0203, ne02_fd, s01, s02, s03, d_Q);
 }
 
 } // namespace
@@ -1478,6 +1707,19 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
+        default:
+            return nullptr;
+    }
+}
+
+to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda_tbqp_mse(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQP3_0:
+            return dequantize_row_tbqp3_mse_nc_cuda;
+        case GGML_TYPE_TBQP4_0:
+            return dequantize_row_tbqp4_mse_nc_cuda;
+        case GGML_TYPE_TBQP34_0:
+            return dequantize_row_tbqp34_mse_nc_cuda;
         default:
             return nullptr;
     }

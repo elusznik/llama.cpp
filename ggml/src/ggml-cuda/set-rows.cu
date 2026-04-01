@@ -643,15 +643,10 @@ static __global__ void k_set_rows_tbqp3(
         }
         __syncthreads();
 
-        // Store norm/gamma (block 0 only)
+        // Store norm/gamma for every 256-element block
         if (tid == 0) {
-            if (block_idx == 0) {
-                dst_row_ptr[block_idx].d = __float2half(norm);
-                dst_row_ptr[block_idx].gamma = __float2half(gamma);
-            } else {
-                dst_row_ptr[block_idx].d = __float2half(0.0f);
-                dst_row_ptr[block_idx].gamma = __float2half(0.0f);
-            }
+            dst_row_ptr[block_idx].d = __float2half(norm);
+            dst_row_ptr[block_idx].gamma = __float2half(gamma);
         }
         __syncthreads();
 
@@ -840,15 +835,10 @@ static __global__ void k_set_rows_tbqp4(
         }
         __syncthreads();
 
-        // Store norm/gamma (block 0 only)
+        // Store norm/gamma for every 256-element block
         if (tid == 0) {
-            if (block_idx == 0) {
-                dst_row_ptr[block_idx].d = __float2half(norm);
-                dst_row_ptr[block_idx].gamma = __float2half(gamma);
-            } else {
-                dst_row_ptr[block_idx].d = __float2half(0.0f);
-                dst_row_ptr[block_idx].gamma = __float2half(0.0f);
-            }
+            dst_row_ptr[block_idx].d = __float2half(norm);
+            dst_row_ptr[block_idx].gamma = __float2half(gamma);
         }
         __syncthreads();
 
@@ -1059,15 +1049,10 @@ static __global__ void k_set_rows_tbqp34(
         }
         __syncthreads();
 
-        // Store norm/gamma (block 0 only)
+        // Store norm/gamma for every 256-element block
         if (tid == 0) {
-            if (block_idx == 0) {
-                dst_row_ptr[block_idx].d = __float2half(norm);
-                dst_row_ptr[block_idx].gamma = __float2half(gamma);
-            } else {
-                dst_row_ptr[block_idx].d = __float2half(0.0f);
-                dst_row_ptr[block_idx].gamma = __float2half(0.0f);
-            }
+            dst_row_ptr[block_idx].d = __float2half(norm);
+            dst_row_ptr[block_idx].gamma = __float2half(gamma);
         }
         __syncthreads();
 
