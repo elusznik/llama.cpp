@@ -540,6 +540,74 @@ static inline __m128i get_scale_shuffle(int i) {
 }
 #endif
 
+void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK1_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q1_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+#if defined(__AVX2__)
+    // Each Q1_0 block: 1 scale (d) + 16 bytes (128 1-bit values).
+    // Each block multiplies against 4 x Q8_0 blocks (4 x 32 values).
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        // Process 4 sub-blocks of 32 values each
+        for (int k = 0; k < 4; ++k) {
+            const float d1 = GGML_CPU_FP16_TO_FP32(y[i*4 + k].d);
+
+            // Extract 32 bits from qs starting at byte k*4, convert to ±1
+            const __m256i bits = bytes_from_bits_32(x[i].qs + k*4);
+            const __m256i qx = _mm256_sub_epi8(
+                _mm256_slli_epi16(bits, 1),
+                _mm256_set1_epi8(1));
+
+            const __m256i qy = _mm256_loadu_si256((const __m256i *)y[i*4 + k].qs);
+            const __m256 d = _mm256_set1_ps(d0 * d1);
+
+#if defined(__FMA__)
+            acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+#else
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(d, mul_sum_i8_pairs_float(qx, qy)));
+#endif
+        }
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    // Scalar fallback
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        float sumi = 0.0f;
+        for (int k = 0; k < 4; k++) {
+            const float d1 = GGML_CPU_FP16_TO_FP32(y[i*4 + k].d);
+            int sumi_block = 0;
+            for (int j = 0; j < QK8_0; j++) {
+                const int bit_index = k * QK8_0 + j;
+                const int byte_index = bit_index / 8;
+                const int bit_offset = bit_index % 8;
+                const int xi = ((x[i].qs[byte_index] >> bit_offset) & 1) ? 1 : -1;
+                sumi_block += xi * y[i*4 + k].qs[j];
+            }
+            sumi += d1 * sumi_block;
+        }
+        sumf += d0 * sumi;
+    }
+    *s = sumf;
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
