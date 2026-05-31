@@ -118,6 +118,7 @@ extern "C" {
         ggml_vec_dot_t           vec_dot;
         enum ggml_type           vec_dot_type;
         int64_t                  nrows; // number of rows to process simultaneously
+        ggml_to_float_t          to_float; // optional SIMD override of the base to_float
     };
 
     GGML_BACKEND_API const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);

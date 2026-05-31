@@ -392,12 +392,14 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_TBQ3_0] = {
         .from_float               = quantize_row_tbq3_0,
+        .to_float                 = (ggml_to_float_t) ggml_cpu_dequantize_row_tbq3_0,
         .vec_dot                  = ggml_vec_dot_tbq3_0_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
     [GGML_TYPE_TBQ4_0] = {
         .from_float               = quantize_row_tbq4_0,
+        .to_float                 = (ggml_to_float_t) ggml_cpu_dequantize_row_tbq4_0,
         .vec_dot                  = ggml_vec_dot_tbq4_0_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,

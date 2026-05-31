@@ -35,6 +35,10 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
 void quantize_row_tbq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_tbq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 
+// SIMD dequant for the CPU backend (arch-built); wired via cpu traits to_float
+void ggml_cpu_dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_cpu_dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
 void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 

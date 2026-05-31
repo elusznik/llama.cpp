@@ -3,7 +3,6 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "../ggml/src/ggml-quants.h"
-#include "../ggml/src/ggml-turboq.h"
 #include "../ggml/src/ggml-turboq-tables.h"
 
 #undef NDEBUG

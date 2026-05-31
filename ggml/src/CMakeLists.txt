@@ -206,7 +206,7 @@ add_library(ggml-base
             ggml-quants.c
             ggml-quants.h
             ggml-turboq.c
-            ggml-turboq.h
+            ggml-turboq-impl.h
             ggml-turboq-tables.h
             gguf.cpp)
 
